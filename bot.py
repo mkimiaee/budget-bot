@@ -729,10 +729,34 @@ def _tx_action_keyboard(tx):
     rows = [[InlineKeyboardButton("✏️ ویرایش مبلغ", callback_data=f"tx:editamt:{tx_id}")]]
     if tx.get("receipt_id"):
         rows.append([InlineKeyboardButton("🗑 حذف فقط این آیتم", callback_data=f"tx:del:{tx_id}")])
+        rows.append([InlineKeyboardButton("☑️ حذف چندتایی از این فاکتور", callback_data=f"tx:bulkdel:{tx['receipt_id']}")])
         rows.append([InlineKeyboardButton("🗑🧾 حذف کل این فاکتور (همه اقلام)", callback_data=f"tx:delreceipt:{tx['receipt_id']}")])
+        rows.append([InlineKeyboardButton("🏪 تغییر/افزودن فروشگاه این فاکتور", callback_data=f"tx:setstore:{tx['receipt_id']}")])
     else:
         rows.append([InlineKeyboardButton("🗑 حذف این تراکنش", callback_data=f"tx:del:{tx_id}")])
     rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="tx:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _bulk_delete_text_and_keyboard(items, selected, cur):
+    """چک‌لیست تیک‌زدنی برای انتخاب چند آیتم از یک فاکتور جهت حذف هم‌زمان (نه کل فاکتور، نه فقط یک آیتم)."""
+    receipt_id = items[0]["receipt_id"]
+    buttons = []
+    for it in items:
+        mark = "☑️" if it["id"] in selected else "◻️"
+        label = f"{mark} {it['description'] or '—'} — {fmt(it['amount'], cur)}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        buttons.append([InlineKeyboardButton(label, callback_data=f"tx:bulktoggle:{receipt_id}:{it['id']}")])
+    buttons.append([InlineKeyboardButton(f"🗑 حذف انتخاب‌شده‌ها ({len(selected)})", callback_data=f"tx:bulkgo:{receipt_id}")])
+    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"tx:menu:{items[0]['id']}")])
+    text = "☑️ آیتم‌هایی که می‌خوای حذف کنی رو تیک بزن (می‌تونی چندتا انتخاب کنی)، بعد «حذف انتخاب‌شده‌ها» رو بزن:"
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _tx_receipt_store_keyboard(receipt_id):
+    rows = [[InlineKeyboardButton(f"🏪 {name}", callback_data=f"tx:setstoreto:{receipt_id}:{name}")] for name in RECEIPT_STORE_OPTIONS]
+    rows.append([InlineKeyboardButton("🔙 انصراف", callback_data="tx:list")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -789,6 +813,94 @@ async def tx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         receipt_id = parts[2] if len(parts) > 2 else None
         count = db.delete_receipt(household_id, receipt_id) if receipt_id else 0
         await query.edit_message_text(f"🗑 کل فاکتور حذف شد ({count} آیتم).")
+        text, kb = _tx_list_text_and_keyboard(household_id)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=kb)
+        return
+
+    if action == "bulkdel":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        items = db.get_receipt_transactions(household_id, receipt_id) if receipt_id else []
+        if not items:
+            await query.edit_message_text("این فاکتور دیگه پیدا نشد (شاید قبلاً حذف شده).")
+            return
+        selected = context.chat_data.setdefault("bulk_delete_selected", {}).setdefault(receipt_id, set())
+        text, kb = _bulk_delete_text_and_keyboard(items, selected, cur)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if action == "bulktoggle":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        item_tx_id = int(parts[3]) if len(parts) > 3 else None
+        items = db.get_receipt_transactions(household_id, receipt_id) if receipt_id else []
+        if not items:
+            await query.edit_message_text("این فاکتور دیگه پیدا نشد (شاید قبلاً حذف شده).")
+            return
+        selected = context.chat_data.setdefault("bulk_delete_selected", {}).setdefault(receipt_id, set())
+        if item_tx_id in selected:
+            selected.discard(item_tx_id)
+        else:
+            selected.add(item_tx_id)
+        text, kb = _bulk_delete_text_and_keyboard(items, selected, cur)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if action == "bulkgo":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        items = db.get_receipt_transactions(household_id, receipt_id) if receipt_id else []
+        selected = context.chat_data.get("bulk_delete_selected", {}).get(receipt_id, set())
+        chosen = [i for i in items if i["id"] in selected]
+        if not chosen:
+            await query.answer("چیزی انتخاب نشده.", show_alert=True)
+            return
+        total = sum(i["amount"] for i in chosen)
+        lines = "\n".join(f"• {i['description'] or '—'} — {fmt(i['amount'], cur)}" for i in chosen)
+        text = f"❌ این {len(chosen)} آیتم (جمعاً {fmt(total, cur)}) حذف بشن؟\n\n{lines}"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"tx:bulkconfirm:{receipt_id}"),
+            InlineKeyboardButton("❌ انصراف", callback_data=f"tx:bulkdel:{receipt_id}"),
+        ]])
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if action == "bulkconfirm":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        selected = context.chat_data.get("bulk_delete_selected", {}).pop(receipt_id, set())
+        count = 0
+        for del_tx_id in selected:
+            db.delete_transaction(del_tx_id)
+            count += 1
+        await query.edit_message_text(f"🗑 {count} آیتم از این فاکتور حذف شد.")
+        text, kb = _tx_list_text_and_keyboard(household_id)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=kb)
+        return
+
+    if action == "setstore":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        items = db.get_receipt_transactions(household_id, receipt_id) if receipt_id else []
+        if not items:
+            await query.edit_message_text("این فاکتور دیگه پیدا نشد (شاید قبلاً حذف شده).")
+            return
+        current_store = items[0].get("store")
+        note = f"\nفروشگاه فعلی: {current_store}" if current_store else "\nفروشگاهی برای این فاکتور ثبت نشده."
+        await query.edit_message_text(
+            f"این فاکتور ({len(items)} آیتم) رو به کدوم فروشگاه نسبت بدم؟{note}",
+            reply_markup=_tx_receipt_store_keyboard(receipt_id),
+        )
+        return
+
+    if action == "setstoreto":
+        receipt_id = parts[2] if len(parts) > 2 else None
+        store_name = parts[3] if len(parts) > 3 else None
+        items = db.get_receipt_transactions(household_id, receipt_id) if receipt_id else []
+        if not items or not store_name:
+            await query.edit_message_text("این فاکتور دیگه پیدا نشد (شاید قبلاً حذف شده).")
+            return
+        new_cat = db.RECEIPT_STORE_CATEGORY.get(store_name, store_name)
+        for it in items:
+            db.update_transaction(it["id"], store=store_name, category=new_cat)
+        await query.edit_message_text(
+            f"✅ فروشگاه این فاکتور ({len(items)} آیتم) روی «{store_name}» تنظیم شد؛ دسته‌شون هم به «{new_cat}» تغییر کرد."
+        )
         text, kb = _tx_list_text_and_keyboard(household_id)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=kb)
         return
