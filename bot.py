@@ -39,13 +39,6 @@ logger = logging.getLogger("budget-bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# اگه ست بشه، فقط همین آیدی تلگرام اجازه داره با /start مستقیم برای خودش حساب خانواده جدید بسازه؛
-# بقیه باید حتماً کد دعوت داشته باشن و با /join وارد بشن. این جلوی این رو می‌گیره که اگه لینک ربات
-# دست کس دیگه‌ای افتاد، بدون اجازه صاحب ربات بتونه ازش استفاده کنه.
-# اگه ست نشه، اولین نفری که تا حالا اصلاً هیچ خانواده‌ای تو دیتابیس نساخته، خودکار صاحب ربات می‌شه
-# (حالت راه‌اندازی اولیه) — و باید بعد از اون آیدی‌ش رو تو .env بذاره تا این حالت بسته بشه.
-OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
-
 
 # واحدهایی که سنتاً بدون اعشار نوشته می‌شوند (چون ارزش اسمی‌شون خیلی بزرگه و اعشار بی‌معنیه)
 NO_DECIMAL_CURRENCIES = {"تومان", "ریال"}
@@ -102,6 +95,7 @@ def _settings_keyboard():
         [InlineKeyboardButton("💱 تغییر واحد پول", callback_data="m:currency")],
         [InlineKeyboardButton("📁 دسته‌بندی‌ها", callback_data="m:categories")],
         [InlineKeyboardButton("🧾 تراکنش‌های اخیر (حذف/ویرایش)", callback_data="tx:list")],
+        [InlineKeyboardButton("🔄 محاسبه مجدد بودجه و هزینه‌ها", callback_data="m:recalc")],
         [InlineKeyboardButton("🔗 کد دعوت خانواده", callback_data="m:invite")],
     ])
 
@@ -144,49 +138,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU_KEYBOARD,
         )
         return
-
-    # کاربر کاملاً جدیده و هنوز هیچ خانواده‌ای نداره. فقط صاحب ربات (یا — اگه هنوز صاحبی تنظیم نشده —
-    # اولین نفری که تا حالا هیچ‌کس خانواده‌ای نساخته) اجازه داره مستقیم با /start حساب جدید بسازه.
-    # بقیه باید کد دعوت داشته باشن و با /join وارد بشن؛ این جلوی استفاده افراد ناخواسته از ربات رو می‌گیره.
-    is_owner = OWNER_TELEGRAM_ID is not None and str(user.id) == str(OWNER_TELEGRAM_ID).strip()
-    is_bootstrap = OWNER_TELEGRAM_ID is None and db.count_households() == 0
-
-    if not (is_owner or is_bootstrap):
-        await update.message.reply_text(
-            "👋 سلام! این ربات خصوصیه و فقط با کد دعوت قابل استفاده‌ست.\n"
-            "کد دعوت رو از صاحب ربات بگیر، بعد بزن:\n"
-            "`/join CODE`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
     household_id, code = db.create_household_and_user(user.id, user.first_name)
     currency = db.get_currency(household_id)
-    owner_note = ""
-    if OWNER_TELEGRAM_ID is None:
-        owner_note = (
-            f"\n🔒 برای اینکه از این به بعد فقط خودت بتونی با /start حساب جدید بسازی (و کس دیگه‌ای بدون "
-            f"کد دعوت نتونه از ربات استفاده کنه)، آیدی تلگرامت (`{user.id}`) رو تو فایل `.env` این‌طوری اضافه کن:\n"
-            f"`OWNER_TELEGRAM_ID={user.id}`\n"
-            "و ربات رو ری‌استارت کن.\n"
-        )
     await update.message.reply_text(
         f"سلام {user.first_name}! خوش اومدی 👋\n\n"
         f"یک حساب خانواده برات ساختم. کد دعوت: `{code}`\n"
         "این کد رو به بقیه اعضای خانواده بده تا با دستور زیر بهت ملحق بشن:\n"
         f"`/join {code}`\n\n"
-        f"واحد پول فعلاً روی «{currency}» تنظیمه. از منوی ⚙️ تنظیمات می‌تونی عوضش کنی."
-        f"{owner_note}\n"
+        f"واحد پول فعلاً روی «{currency}» تنظیمه. از منوی ⚙️ تنظیمات می‌تونی عوضش کنی.\n\n"
         "از منوی پایین صفحه استفاده کن، یا برای شروع بودجه ماه رو بزن:\n"
         "`/budget 5000000`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=MAIN_MENU_KEYBOARD,
-    )
-
-
-async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"آیدی تلگرام شما: `{update.effective_user.id}`", parse_mode=ParseMode.MARKDOWN
     )
 
 
@@ -205,17 +168,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/income <مبلغ> [توضیح] — ثبت درآمد\n"
         "/expense <مبلغ> [توضیح] — ثبت هزینه (یا فقط بنویس: نان 50000 فروشگاه رفاه تاریخ 2026-07-10)\n"
         "/balance — باقیمانده بودجه\n"
-        "/report day|week|month — گزارش دسته‌بندی‌شده\n"
+        "/recalc — محاسبه مجدد بودجه و هزینه‌ها از صفر (برای اطمینان از درستی عددها)\n"
+        "/report day|week|month — لیست هزینه‌ها (تاریخ و مبلغ) و جمع بازه\n"
         "/transactions — نمایش تراکنش‌های اخیر برای حذف یا ویرایش\n"
         "/newlist — شروع لیست خرید جدید (بعدش هر آیتم رو یک خط بفرست)\n"
-        "/additems — افزودن آیتم بیشتر به لیست فعلی (بدون پاک کردن قبلی‌ها)\n"
         "/donelist — پایان وارد کردن آیتم‌های لیست\n"
         "/list — نمایش وضعیت لیست خرید فعلی\n"
         "/categories — نمایش دسته‌بندی‌ها\n"
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
         "/invite — گرفتن کد دعوت خانواده\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
-        "/whoami — دیدن آیدی تلگرام خودت (برای تنظیم OWNER_TELEGRAM_ID)\n\n"
+        "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n\n"
         "📷 عکس فاکتور یا 📄 فایل PDF فاکتور بفرست تا خودکار با لیست خریدت تطبیق داده بشه و هزینه‌ها ثبت بشن.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
@@ -228,6 +191,24 @@ async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     code = db.get_invite_code(household_id)
     await update.message.reply_text(f"کد دعوت خانواده: `{code}`", parse_mode=ParseMode.MARKDOWN)
+
+
+@require_household
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    """کل فایل دیتابیس (بودجه، تراکنش‌ها، لیست خرید همه خانواده‌ها) رو به همین چت می‌فرسته
+    تا یه نسخه پشتیبان دستی داشته باشی — مستقل از اینکه روی Railway ولوم درست وصل شده یا نه."""
+    try:
+        with open(db.DB_PATH, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"budget-bot-backup-{date.today().isoformat()}.db",
+                caption=(
+                    "📦 نسخه پشتیبان کامل دیتابیس. این فایل رو یه جای امن نگه دار.\n"
+                    "برای بازگردانی: همین فایل رو به‌جای data/bot.db روی سرور بذار."
+                ),
+            )
+    except FileNotFoundError:
+        await update.message.reply_text("فایل دیتابیس پیدا نشد.")
 
 
 async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,8 +277,14 @@ async def currency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, house
 
 
 def _set_budget_and_reply_text(household_id, amount, cur):
+    old = db.get_budget(household_id)
     db.set_budget(household_id, amount)
     label = _period_label(household_id)
+    if old:
+        return (
+            f"✅ بودجه {label} از {fmt(old, cur)} به {fmt(amount, cur)} تغییر کرد "
+            "(عدد قبلی به‌طور کامل جایگزین شد، اضافه نشد)."
+        )
     return f"✅ بودجه {label} روی {fmt(amount, cur)} تنظیم شد."
 
 
@@ -334,7 +321,8 @@ async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
         label = _period_label(household_id)
         msg = f"بودجه {label}: {fmt(b, cur)}" if b else "هنوز بودجه‌ای تنظیم نشده."
         await update.message.reply_text(
-            msg + "\n\nبرای تنظیم: /budget 5000000\nبرای افزایش/کاهش: /budget +500000 یا /budget -200000"
+            msg + "\n\n⚠️ /budget 5000000 → کل بودجه رو با این عدد جایگزین می‌کنه (نه اضافه)."
+            "\n/budget +500000 یا /budget -200000 → فقط به بودجه فعلی اضافه/کم می‌کنه."
         )
         return
     raw = " ".join(context.args)
@@ -502,19 +490,35 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househ
     await update.message.reply_text(_balance_text(household_id))
 
 
+def _recalc_text(household_id):
+    """
+    محاسبه دوباره از صفر: بودجه، درآمد و همه هزینه‌های بازه جاری مستقیم از دیتابیس جمع زده می‌شوند
+    (چیزی کش/ذخیره‌شده جداگونه‌ای برای «باقیمانده» وجود نداره که خراب بشه — هر بار از نو ساخته می‌شه).
+    این گزینه برای اطمینان‌خاطر است، برای وقتی حس می‌کنی عددها به‌هم ریخته.
+    """
+    return "🔄 محاسبه مجدد انجام شد — همه هزینه‌ها و درآمدهای بازه جاری از نو جمع زده شدند:\n\n" + _balance_text(household_id)
+
+
+@require_household
+async def recalc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    await update.message.reply_text(_recalc_text(household_id))
+
+
 def _report_text(household_id, period):
+    """گزارش ساده: فقط لیست تاریخ و مبلغ هر هزینه، بدون دسته/درصد/جزئیات، به‌علاوه جمع بازه (و جمع امروز)."""
     cur = db.get_currency(household_id)
     period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
     period = period_map.get(period, "month")
     r = db.get_report(household_id, period)
     title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
-    if not r["by_category"]:
+    if not r["transactions"]:
         return f"هیچ هزینه‌ای برای {title} ثبت نشده."
-    lines = [f"📊 گزارش هزینه‌ها — {title}\n"]
-    for row in r["by_category"]:
-        pct = (row["total"] / r["total"] * 100) if r["total"] else 0
-        lines.append(f"• {row['cat']}: {fmt(row['total'], cur)} ({pct:.0f}٪ — {row['cnt']} مورد)")
-    lines.append(f"\nجمع کل: {fmt(r['total'], cur)}")
+    lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
+    for t in r["transactions"]:
+        lines.append(f"{t['tx_date']} — {fmt(t['amount'], cur)}")
+    lines.append(f"\nجمع {title}: {fmt(r['total'], cur)}")
+    if period != "day":
+        lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
     return "\n".join(lines)
 
 
@@ -547,8 +551,7 @@ async def newlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househ
     await update.message.reply_text(
         "🛒 لیست خرید جدید شروع شد.\n"
         "هر آیتم رو تو یک خط بفرست (می‌تونی چند خط با هم هم بفرستی).\n"
-        "وقتی تموم شد، /donelist رو بزن (یا اگه چیزی ننویسی و رد کنی، بعداً هر وقت خواستی "
-        "با دکمه «➕ افزودن آیتم» تو 🛒 لیست خرید می‌تونی آیتم اضافه کنی)."
+        "وقتی تموم شد، /donelist رو بزن."
     )
 
 
@@ -561,23 +564,7 @@ async def donelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, house
     items = db.get_list_items(list_id)
     await update.message.reply_text(
         f"✅ لیست با {len(items)} آیتم ثبت شد.\n"
-        "هر وقت خرید کردی، عکس فاکتور رو بفرست یا با /list آیتم‌ها رو دستی تیک بزن.\n"
-        "هر وقت هم خواستی آیتم بیشتری اضافه کنی، از 🛒 لیست خرید روی «➕ افزودن آیتم» بزن یا /additems رو بفرست "
-        "— توجه کن: تا وقتی رو دکمه/دستور «افزودن آیتم» نزنی، پیام‌های عادی به‌عنوان هزینه ثبت می‌شن، نه آیتم لیست."
-    )
-
-
-@require_household
-async def additems_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
-    active = db.get_active_list(household_id)
-    if not active:
-        list_id = db.create_shopping_list(household_id)
-    else:
-        list_id = active["id"]
-    context.chat_data["collecting_list_id"] = list_id
-    await update.message.reply_text(
-        "➕ حالت افزودن آیتم فعال شد. هر آیتم رو تو یک خط بفرست.\n"
-        "وقتی تموم شد، /donelist رو بزن."
+        "هر وقت خرید کردی، عکس فاکتور رو بفرست یا با /list آیتم‌ها رو دستی تیک بزن."
     )
 
 
@@ -586,16 +573,8 @@ def _list_keyboard(list_id, items):
     for it in items:
         mark = "✅" if it["bought"] else "◻️"
         buttons.append([InlineKeyboardButton(f"{mark} {it['item_name']}", callback_data=f"toggle:{list_id}:{it['id']}")])
-    buttons.append([InlineKeyboardButton("➕ افزودن آیتم", callback_data="m:list:add")])
-    buttons.append([InlineKeyboardButton("🆕 لیست کاملاً جدید", callback_data="m:list:new")])
+    buttons.append([InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")])
     return InlineKeyboardMarkup(buttons)
-
-
-def _empty_list_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ افزودن آیتم", callback_data="m:list:add")],
-        [InlineKeyboardButton("🆕 لیست کاملاً جدید", callback_data="m:list:new")],
-    ])
 
 
 @require_household
@@ -609,7 +588,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household
         return
     items = db.get_list_items(active["id"])
     if not items:
-        await update.message.reply_text("این لیست هنوز آیتمی نداره.", reply_markup=_empty_list_keyboard())
+        await update.message.reply_text("این لیست هنوز آیتمی نداره.")
         return
     remaining = [i for i in items if not i["bought"]]
     text = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
@@ -799,7 +778,7 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return True
         items = db.get_list_items(active["id"])
         if not items:
-            await update.message.reply_text("این لیست هنوز آیتمی نداره.", reply_markup=_empty_list_keyboard())
+            await update.message.reply_text("این لیست هنوز آیتمی نداره.")
             return True
         remaining = [i for i in items if not i["bought"]]
         msg = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
@@ -841,9 +820,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "budget":
         context.chat_data["awaiting"] = "budget"
         label = _period_label(household_id)
+        cur = db.get_currency(household_id)
+        current = db.get_budget(household_id)
+        current_line = f"بودجه فعلی {label}: {fmt(current, cur)}\n\n" if current else ""
         await query.edit_message_text(
-            f"مبلغ بودجه {label} رو بفرست (مثلاً 5000000)\n"
-            "یا برای افزایش/کاهش بودجه فعلی، با علامت +/- بفرست (مثلاً +500000 یا -200000)."
+            f"{current_line}"
+            f"⚠️ اگه یه عدد ساده بفرستی (مثلاً 5000000)، بودجه {label} کاملاً با همون عدد جایگزین می‌شه (نه اضافه).\n"
+            "اگه فقط می‌خوای به بودجه فعلی اضافه/کم کنی، با علامت +/- بفرست (مثلاً +500000 یا -200000)."
         )
 
     elif action == "period" and len(parts) == 2:
@@ -878,6 +861,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = db.get_invite_code(household_id)
         await query.edit_message_text(f"کد دعوت خانواده: {code}")
 
+    elif action == "recalc":
+        await query.edit_message_text(_recalc_text(household_id), reply_markup=_settings_keyboard())
+
     elif action == "report" and len(parts) > 2:
         period = parts[2]
         await query.edit_message_text(_report_text(household_id, period), reply_markup=_report_period_keyboard())
@@ -888,15 +874,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🛒 لیست خرید جدید شروع شد.\n"
             "هر آیتم رو تو یک خط بفرست. وقتی تموم شد، /donelist رو بزن."
-        )
-
-    elif action == "list" and len(parts) > 2 and parts[2] == "add":
-        active = db.get_active_list(household_id)
-        list_id = active["id"] if active else db.create_shopping_list(household_id)
-        context.chat_data["collecting_list_id"] = list_id
-        await query.edit_message_text(
-            "➕ حالت افزودن آیتم فعال شد. هر آیتم رو تو یک خط بفرست.\n"
-            "وقتی تموم شد، /donelist رو بزن."
         )
 
 
@@ -1244,8 +1221,8 @@ async def _post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("menu", "باز کردن منوی اصلی"),
         BotCommand("start", "شروع / ساخت حساب خانواده"),
-        BotCommand("whoami", "دیدن آیدی تلگرام خودت"),
         BotCommand("balance", "باقیمانده بودجه"),
+        BotCommand("recalc", "محاسبه مجدد بودجه و هزینه‌ها"),
         BotCommand("budget", "تنظیم بودجه بازه جاری"),
         BotCommand("period", "بازه بودجه: هفتگی یا ماهانه"),
         BotCommand("expense", "ثبت هزینه"),
@@ -1253,12 +1230,12 @@ async def _post_init(application: Application):
         BotCommand("report", "گزارش دسته‌بندی‌شده"),
         BotCommand("transactions", "تراکنش‌های اخیر (حذف/ویرایش)"),
         BotCommand("newlist", "لیست خرید جدید"),
-        BotCommand("additems", "افزودن آیتم به لیست فعلی"),
         BotCommand("list", "نمایش لیست خرید"),
         BotCommand("currency", "تغییر واحد پول"),
         BotCommand("categories", "دسته‌بندی‌ها"),
         BotCommand("invite", "کد دعوت خانواده"),
         BotCommand("join", "پیوستن به خانواده‌ای دیگر"),
+        BotCommand("backup", "دریافت نسخه پشتیبان دیتابیس"),
         BotCommand("help", "راهنما"),
     ])
 
@@ -1272,22 +1249,22 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("budget", budget_cmd))
     app.add_handler(CommandHandler("period", period_cmd))
     app.add_handler(CommandHandler("income", income_cmd))
     app.add_handler(CommandHandler("expense", expense_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("recalc", recalc_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("transactions", transactions_cmd))
     app.add_handler(CommandHandler("categories", categories_cmd))
     app.add_handler(CommandHandler("currency", currency_cmd))
     app.add_handler(CommandHandler("newlist", newlist_cmd))
-    app.add_handler(CommandHandler("additems", additems_cmd))
     app.add_handler(CommandHandler("donelist", donelist_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
 

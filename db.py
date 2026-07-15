@@ -160,13 +160,6 @@ def _new_invite_code():
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-def count_households():
-    """تعداد کل خانواده‌های ساخته‌شده در دیتابیس (برای تشخیص «اولین کاربر ربات» در حالت bootstrap)."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) c FROM households").fetchone()
-        return row["c"]
-
-
 def get_user_household(telegram_id):
     with get_conn() as conn:
         row = conn.execute("SELECT household_id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
@@ -410,12 +403,20 @@ def get_balance(household_id):
 
 
 def get_report(household_id, period):
+    """
+    گزارش ساده: لیست تراکنش‌های هزینه (فقط تاریخ و مبلغ) برای بازه انتخاب‌شده، به‌علاوه جمع کل.
+    برای 'week' از همان روز شروع هفته‌ای استفاده می‌شود که در تنظیمات بازه بودجه انتخاب شده
+    (week_start_weekday)، تا جمع گزارش هفتگی همیشه با محاسبه /balance یکی باشد. اگر خانواده
+    هنوز روز شروع هفته را تنظیم نکرده، پیش‌فرض دوشنبه است.
+    """
     today = date.today()
     if period in ("day", "روز"):
         start, end = today.isoformat(), today.isoformat()
     elif period in ("week", "هفته"):
-        # هفته تقویمی استاندارد (دوشنبه تا امروز) صرف‌نظر از تنظیم بازه بودجه؛ برای مرور سریع
-        start = (today - timedelta(days=today.weekday())).isoformat()
+        p = get_budget_period(household_id)
+        wd = p["week_start_weekday"] if p["week_start_weekday"] is not None else 0
+        days_since_start = (today.weekday() - wd) % 7
+        start = (today - timedelta(days=days_since_start)).isoformat()
         end = today.isoformat()
     elif period in ("period", "بازه"):
         # دقیقاً همان بازه بودجه‌ای که خانواده تنظیم کرده (هفتگی یا ماهانه)
@@ -427,14 +428,20 @@ def get_report(household_id, period):
 
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT COALESCE(category,'متفرقه') cat, SUM(amount) total, COUNT(*) cnt
-               FROM transactions
+            """SELECT tx_date, amount FROM transactions
                WHERE household_id=? AND type='expense' AND tx_date BETWEEN ? AND ?
-               GROUP BY cat ORDER BY total DESC""",
+               ORDER BY tx_date, id""",
             (household_id, start, end),
         ).fetchall()
-        total = sum(r["total"] for r in rows)
-        return {"start": start, "end": end, "by_category": [dict(r) for r in rows], "total": total}
+        total = sum(r["amount"] for r in rows)
+        today_total = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat())
+        return {
+            "start": start,
+            "end": end,
+            "transactions": [dict(r) for r in rows],
+            "total": total,
+            "today_total": today_total,
+        }
 
 
 def get_categories(household_id):
