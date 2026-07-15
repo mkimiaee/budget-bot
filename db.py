@@ -114,8 +114,19 @@ DEFAULT_CATEGORIES = [
     ("تنقلات و نوشیدنی", "نوشابه,آبمیوه,چیپس,بیسکویت,شکلات,آدامس,تنقلات"),
     ("حمل و نقل", "بنزین,تاکسی,اسنپ,پارکینگ,مترو,اتوبوس"),
     ("قبض و اجاره", "قبض,اجاره,شارژ,اینترنت,آب,برق,گاز"),
+    ("خرید از Mercadona", "mercadona"),
+    ("خرید از Consum", "consum"),
+    ("خرید از Lidl", "lidl"),
     ("متفرقه", ""),
 ]
+
+# وقتی موقع تایید فاکتور، کاربر فروشگاه رو دستی از دکمه انتخاب می‌کنه (نه از روی تشخیص خودکار متن)،
+# این نگاشت مشخص می‌کنه اسم دسته متناظر با هر فروشگاه چیه — باید با نام‌های DEFAULT_CATEGORIES بالا یکی باشه.
+RECEIPT_STORE_CATEGORY = {
+    "Mercadona": "خرید از Mercadona",
+    "Consum": "خرید از Consum",
+    "Lidl": "خرید از Lidl",
+}
 
 
 @contextmanager
@@ -147,9 +158,14 @@ def init_db():
             conn.execute("ALTER TABLE transactions ADD COLUMN store TEXT")
         if "receipt_id" not in tx_cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN receipt_id TEXT")
-        existing = conn.execute("SELECT COUNT(*) c FROM categories WHERE household_id IS NULL").fetchone()["c"]
-        if existing == 0:
-            for name, kw in DEFAULT_CATEGORIES:
+        # هر دسته پیش‌فرض که هنوز تو دیتابیس نیست رو اضافه کن (نه فقط بار اول) — این‌جوری وقتی بعداً
+        # به DEFAULT_CATEGORIES یک دسته جدید اضافه می‌شه (مثل فروشگاه‌های جدید)، با ری‌استارت بعدی ربات
+        # خودش به دیتابیس‌های قدیمی هم اضافه می‌شه، بدون اینکه دسته‌های موجود دوباره ساخته/تکرار بشن.
+        existing_names = {
+            r["name"] for r in conn.execute("SELECT name FROM categories WHERE household_id IS NULL").fetchall()
+        }
+        for name, kw in DEFAULT_CATEGORIES:
+            if name not in existing_names:
                 conn.execute(
                     "INSERT INTO categories (household_id, name, keywords) VALUES (NULL, ?, ?)",
                     (name, kw),

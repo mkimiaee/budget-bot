@@ -414,15 +414,42 @@ def _date_choice_keyboard():
     ])
 
 
+def _category_choice_keyboard(context, household_id, callback_prefix):
+    """دکمه‌های همه دسته‌بندی‌ها (خانواده + سراسری، از جمله فروشگاه‌های اضافه‌شده) به‌علاوه یک گزینه
+    «تشخیص خودکار». لیست نام دسته‌ها رو تو chat_data نگه می‌داره تا callback_data فقط ایندکس بفرسته."""
+    names = [c["name"] for c in db.get_categories(household_id)]
+    context.chat_data["expense_categories_choice"] = names
+    buttons = [[InlineKeyboardButton("🤖 تشخیص خودکار", callback_data=f"{callback_prefix}:auto")]]
+    row = []
+    for i, name in enumerate(names):
+        row.append(InlineKeyboardButton(name, callback_data=f"{callback_prefix}:{i}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _ask_expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id, via_callback: bool):
+    kb = _category_choice_keyboard(context, household_id, "excat")
+    text = "🏷 دسته‌بندی این هزینه رو انتخاب کن (یا بذار خودش از روی توضیح تشخیص بده):"
+    if via_callback:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
+
+
 async def _commit_expense_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id, via_callback: bool):
     draft = context.chat_data.pop("expense_draft", {})
+    context.chat_data.pop("expense_categories_choice", None)
     context.chat_data.pop("awaiting", None)
     cur = db.get_currency(household_id)
     amount = draft.get("amount")
     desc = draft.get("description")
     store = draft.get("store")
     tx_date = draft.get("tx_date") or date.today().isoformat()
-    cat = categorize.categorize(desc, household_id) if desc else "متفرقه"
+    cat = draft.get("category") or (categorize.categorize(desc, household_id) if desc else "متفرقه")
     user_id = update.effective_user.id
 
     db.add_transaction(
@@ -475,13 +502,40 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if choice == "today":
             draft["tx_date"] = date.today().isoformat()
-            await _commit_expense_draft(update, context, household_id, via_callback=True)
+            await _ask_expense_category(update, context, household_id, via_callback=True)
         elif choice == "yesterday":
             draft["tx_date"] = (date.today() - timedelta(days=1)).isoformat()
-            await _commit_expense_draft(update, context, household_id, via_callback=True)
+            await _ask_expense_category(update, context, household_id, via_callback=True)
         elif choice == "manual":
             context.chat_data["awaiting"] = "expense_date_manual"
             await query.edit_message_text("تاریخ خرید رو بفرست، مثلاً 2026-07-15 یا 15-07-2026:")
+
+
+async def excat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """انتخاب دسته‌بندی از دکمه‌ها، آخرین قدم ثبت هزینه مرحله‌به‌مرحله (بعد از تاریخ)."""
+    query = update.callback_query
+    await query.answer()
+    household_id = db.get_user_household(update.effective_user.id)
+    if household_id is None:
+        await query.edit_message_text("اول /start رو بزن.")
+        return
+
+    draft = context.chat_data.get("expense_draft")
+    if not draft or "amount" not in draft:
+        await query.edit_message_text("این فرآیند منقضی شده. دوباره از ➖ ثبت هزینه شروع کن.")
+        return
+
+    choice = query.data.split(":", 1)[1] if ":" in query.data else ""
+    if choice != "auto":
+        names = context.chat_data.get("expense_categories_choice", [])
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(names):
+            draft["category"] = names[idx]
+
+    await _commit_expense_draft(update, context, household_id, via_callback=True)
 
 
 def _balance_text(household_id):
@@ -1015,18 +1069,29 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
             context.chat_data["awaiting"] = "expense_date_manual"
             return
         draft["tx_date"] = tx_date
-        await _commit_expense_draft(update, context, household_id, via_callback=False)
+        await _ask_expense_category(update, context, household_id, via_callback=False)
         return
 
     # حالت ۴ (پیش‌فرض): پیام را به‌عنوان هزینه ثبت کن
     await _register_expense(update, household_id, text, source="manual")
 
 
-def _receipt_preview_text_and_keyboard(cur, lines, note=None):
-    """پیش‌نمایش آیتم‌های استخراج‌شده از فاکتور، قبل از ثبت نهایی — با دکمه حذف روی هر آیتم اشتباه."""
+RECEIPT_STORE_OPTIONS = ["Mercadona", "Consum", "Lidl"]
+
+
+def _receipt_store_keyboard():
+    rows = [[InlineKeyboardButton(f"🏪 {name}", callback_data=f"rcpt:setstore:{name}")] for name in RECEIPT_STORE_OPTIONS]
+    rows.append([InlineKeyboardButton("🔙 بازگشت (بدون تغییر)", callback_data="rcpt:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _receipt_preview_text_and_keyboard(cur, lines, note=None, store=None):
+    """پیش‌نمایش آیتم‌های استخراج‌شده از فاکتور، قبل از ثبت نهایی — با دکمه حذف روی هر آیتم اشتباه
+    و یک دکمه برای انتخاب فروشگاه (که دسته‌بندی کل فاکتور رو هم مشخص می‌کنه)."""
     body = ["🧾 آیتم‌های تشخیص داده‌شده از فاکتور — قبل از ثبت بررسی کن:"]
     if note:
         body.append(note)
+    body.append(f"🏪 فروشگاه: {store}" if store else "🏪 فروشگاه: انتخاب نشده")
     body.append("")
     total = 0.0
     buttons = []
@@ -1037,6 +1102,7 @@ def _receipt_preview_text_and_keyboard(cur, lines, note=None):
         buttons.append([InlineKeyboardButton(label, callback_data=f"rcpt:rm:{idx}")])
     body.append(f"\nجمع فعلی: {fmt(total, cur)}")
     body.append("\nاگه ردیفی اشتباه تشخیص داده شده، با دکمه‌ش حذفش کن؛ بعد «تایید و ثبت» رو بزن.")
+    buttons.append([InlineKeyboardButton("🏪 انتخاب/تغییر فروشگاه", callback_data="rcpt:store")])
     buttons.append([
         InlineKeyboardButton("✅ تایید و ثبت", callback_data="rcpt:confirm"),
         InlineKeyboardButton("🚫 لغو کامل", callback_data="rcpt:cancel"),
@@ -1058,28 +1124,33 @@ async def _process_receipt_lines(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     cur = db.get_currency(household_id)
-    context.chat_data["receipt_draft"] = {"lines": receipt_lines, "note": note}
+    context.chat_data["receipt_draft"] = {"lines": receipt_lines, "note": note, "store": None}
     text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note)
     await update.message.reply_text(text, reply_markup=kb)
 
 
-async def _finalize_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id, lines, note):
+async def _finalize_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id, lines, note, store=None):
     """بعد از تایید کاربر، آیتم‌های باقی‌مانده در پیش‌نویس را واقعاً ثبت می‌کند، با لیست خرید تطبیق می‌دهد،
-    و همه با یک receipt_id مشترک ذخیره می‌شوند تا بعداً بشه کل فاکتور را یک‌جا حذف کرد."""
+    و همه با یک receipt_id مشترک ذخیره می‌شوند تا بعداً بشه کل فاکتور را یک‌جا حذف کرد.
+    اگه کاربر فروشگاه رو دستی انتخاب کرده باشه، همه ردیف‌ها با اون فروشگاه + دسته متناظرش ثبت می‌شن
+    (به‌جای تشخیص خودکار دسته از روی نام هر کالا)."""
     cur = db.get_currency(household_id)
     active = db.get_active_list(household_id)
     receipt_id = uuid.uuid4().hex[:10]
+    forced_category = db.RECEIPT_STORE_CATEGORY.get(store) if store else None
     reply_lines = ["🧾 ثبت شد:"]
     if note:
         reply_lines.append(note)
+    if store:
+        reply_lines.append(f"🏪 فروشگاه: {store}")
     reply_lines.append("")
     total = 0.0
     for rl in lines:
         reply_lines.append(f"• {rl['name']} — {fmt(rl['amount'], cur)}")
         total += rl["amount"]
-        cat = categorize.categorize(rl["name"], household_id)
+        cat = forced_category or categorize.categorize(rl["name"], household_id)
         db.add_transaction(household_id, update.effective_user.id, "expense", rl["amount"],
-                            category=cat, description=rl["name"], source="ocr", receipt_id=receipt_id)
+                            category=cat, description=rl["name"], source="ocr", receipt_id=receipt_id, store=store)
     reply_lines.append(f"\nجمع: {fmt(total, cur)} — همه به‌عنوان هزینه ثبت شدند.")
     reply_lines.append("(اگه بعداً دیدی اشتباه بوده، از ⚙️ تنظیمات → تراکنش‌های اخیر می‌تونی کل این فاکتور رو یک‌جا حذف کنی.)")
 
@@ -1130,7 +1201,22 @@ async def rcpt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data.pop("receipt_draft", None)
             await query.edit_message_text("همه آیتم‌ها حذف شدن؛ چیزی ثبت نشد.")
             return
-        text, kb = _receipt_preview_text_and_keyboard(cur, lines, draft.get("note"))
+        text, kb = _receipt_preview_text_and_keyboard(cur, lines, draft.get("note"), draft.get("store"))
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if action == "store":
+        await query.edit_message_text("کدوم فروشگاهه؟", reply_markup=_receipt_store_keyboard())
+        return
+
+    if action == "setstore" and len(parts) > 2:
+        draft["store"] = parts[2]
+        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"))
+        await query.edit_message_text(text, reply_markup=kb)
+        return
+
+    if action == "back":
+        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"))
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -1141,11 +1227,12 @@ async def rcpt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "confirm":
         lines = draft["lines"]
+        store = draft.get("store")
         context.chat_data.pop("receipt_draft", None)
         if not lines:
             await query.edit_message_text("آیتمی برای ثبت نمونده بود.")
             return
-        text = await _finalize_receipt(update, context, household_id, lines, draft.get("note"))
+        text = await _finalize_receipt(update, context, household_id, lines, draft.get("note"), store)
         await query.edit_message_text(text)
         return
 
@@ -1307,6 +1394,7 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(tx_callback, pattern=r"^tx:"))
     app.add_handler(CallbackQueryHandler(exp_callback, pattern=r"^exp:"))
+    app.add_handler(CallbackQueryHandler(excat_callback, pattern=r"^excat:"))
     app.add_handler(CallbackQueryHandler(rcpt_callback, pattern=r"^rcpt:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
