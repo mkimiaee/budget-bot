@@ -8,6 +8,7 @@ import secrets
 import string
 from datetime import datetime, date, timedelta
 from contextlib import contextmanager
+from collections import Counter
 
 DB_PATH = os.environ.get("BOT_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "bot.db"))
 
@@ -404,7 +405,9 @@ def get_balance(household_id):
 
 def get_report(household_id, period):
     """
-    گزارش ساده: لیست تراکنش‌های هزینه (فقط تاریخ و مبلغ) برای بازه انتخاب‌شده، به‌علاوه جمع کل.
+    گزارش ساده: هر فاکتور (همه ردیف‌های یک عکس/PDF که receipt_id مشترک دارند) یک ردیف واحد
+    می‌شود (با جمع مبلغش)، و هر هزینه دستی هم یک ردیف جدا؛ فقط تاریخ، یک برچسب کوتاه، و مبلغ —
+    بدون جزئیات ردیف‌به‌ردیف فاکتور. به‌علاوه جمع کل بازه و جمع امروز.
     برای 'week' از همان روز شروع هفته‌ای استفاده می‌شود که در تنظیمات بازه بودجه انتخاب شده
     (week_start_weekday)، تا جمع گزارش هفتگی همیشه با محاسبه /balance یکی باشد. اگر خانواده
     هنوز روز شروع هفته را تنظیم نکرده، پیش‌فرض دوشنبه است.
@@ -428,20 +431,43 @@ def get_report(household_id, period):
 
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT tx_date, amount FROM transactions
+            """SELECT tx_date, amount, category, description, receipt_id FROM transactions
                WHERE household_id=? AND type='expense' AND tx_date BETWEEN ? AND ?
                ORDER BY tx_date, id""",
             (household_id, start, end),
         ).fetchall()
-        total = sum(r["amount"] for r in rows)
         today_total = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat())
-        return {
-            "start": start,
-            "end": end,
-            "transactions": [dict(r) for r in rows],
-            "total": total,
-            "today_total": today_total,
-        }
+
+    groups = []
+    receipts_by_id = {}
+    for r in rows:
+        rid = r["receipt_id"]
+        if rid:
+            g = receipts_by_id.get(rid)
+            if g is None:
+                g = {"tx_date": r["tx_date"], "amount": 0.0, "categories": [], "count": 0, "receipt_id": rid}
+                receipts_by_id[rid] = g
+                groups.append(g)
+            g["amount"] += r["amount"]
+            g["categories"].append(r["category"] or "متفرقه")
+            g["count"] += 1
+        else:
+            groups.append({
+                "tx_date": r["tx_date"], "amount": r["amount"], "count": 1, "receipt_id": None,
+                "label": r["description"] or r["category"] or "هزینه",
+            })
+
+    for g in groups:
+        if g.get("receipt_id"):
+            if g["count"] == 1:
+                g["label"] = g["categories"][0]
+            else:
+                cat_name, cat_count = Counter(g["categories"]).most_common(1)[0]
+                g["label"] = f"{cat_name} ({g['count']} قلم)" if cat_count / g["count"] >= 0.5 else f"خرید ({g['count']} قلم)"
+            g.pop("categories", None)
+
+    total = sum(g["amount"] for g in groups)
+    return {"start": start, "end": end, "groups": groups, "total": total, "today_total": today_total}
 
 
 def get_categories(household_id):

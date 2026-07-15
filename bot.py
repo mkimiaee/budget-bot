@@ -505,17 +505,31 @@ async def recalc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
 
 
 def _report_text(household_id, period):
-    """گزارش ساده: فقط لیست تاریخ و مبلغ هر هزینه، بدون دسته/درصد/جزئیات، به‌علاوه جمع بازه (و جمع امروز)."""
+    """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
+    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز)."""
     cur = db.get_currency(household_id)
     period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
     period = period_map.get(period, "month")
     r = db.get_report(household_id, period)
     title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
-    if not r["transactions"]:
+    if not r["groups"]:
         return f"هیچ هزینه‌ای برای {title} ثبت نشده."
+
     lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
-    for t in r["transactions"]:
-        lines.append(f"{t['tx_date']} — {fmt(t['amount'], cur)}")
+    if period == "day":
+        for i, g in enumerate(r["groups"], 1):
+            lines.append(f"{i}. {g['label']} — {fmt(g['amount'], cur)}")
+    else:
+        current_date, idx = None, 0
+        for g in r["groups"]:
+            if g["tx_date"] != current_date:
+                if current_date is not None:
+                    lines.append("")
+                lines.append(f"📅 {g['tx_date']}")
+                current_date, idx = g["tx_date"], 0
+            idx += 1
+            lines.append(f"  {idx}. {g['label']} — {fmt(g['amount'], cur)}")
+
     lines.append(f"\nجمع {title}: {fmt(r['total'], cur)}")
     if period != "day":
         lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
