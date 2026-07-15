@@ -170,6 +170,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/report day|week|month — گزارش دسته‌بندی‌شده\n"
         "/transactions — نمایش تراکنش‌های اخیر برای حذف یا ویرایش\n"
         "/newlist — شروع لیست خرید جدید (بعدش هر آیتم رو یک خط بفرست)\n"
+        "/additems — افزودن آیتم بیشتر به لیست فعلی (بدون پاک کردن قبلی‌ها)\n"
         "/donelist — پایان وارد کردن آیتم‌های لیست\n"
         "/list — نمایش وضعیت لیست خرید فعلی\n"
         "/categories — نمایش دسته‌بندی‌ها\n"
@@ -507,7 +508,8 @@ async def newlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househ
     await update.message.reply_text(
         "🛒 لیست خرید جدید شروع شد.\n"
         "هر آیتم رو تو یک خط بفرست (می‌تونی چند خط با هم هم بفرستی).\n"
-        "وقتی تموم شد، /donelist رو بزن."
+        "وقتی تموم شد، /donelist رو بزن (یا اگه چیزی ننویسی و رد کنی، بعداً هر وقت خواستی "
+        "با دکمه «➕ افزودن آیتم» تو 🛒 لیست خرید می‌تونی آیتم اضافه کنی)."
     )
 
 
@@ -520,7 +522,23 @@ async def donelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, house
     items = db.get_list_items(list_id)
     await update.message.reply_text(
         f"✅ لیست با {len(items)} آیتم ثبت شد.\n"
-        "هر وقت خرید کردی، عکس فاکتور رو بفرست یا با /list آیتم‌ها رو دستی تیک بزن."
+        "هر وقت خرید کردی، عکس فاکتور رو بفرست یا با /list آیتم‌ها رو دستی تیک بزن.\n"
+        "هر وقت هم خواستی آیتم بیشتری اضافه کنی، از 🛒 لیست خرید روی «➕ افزودن آیتم» بزن یا /additems رو بفرست "
+        "— توجه کن: تا وقتی رو دکمه/دستور «افزودن آیتم» نزنی، پیام‌های عادی به‌عنوان هزینه ثبت می‌شن، نه آیتم لیست."
+    )
+
+
+@require_household
+async def additems_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    active = db.get_active_list(household_id)
+    if not active:
+        list_id = db.create_shopping_list(household_id)
+    else:
+        list_id = active["id"]
+    context.chat_data["collecting_list_id"] = list_id
+    await update.message.reply_text(
+        "➕ حالت افزودن آیتم فعال شد. هر آیتم رو تو یک خط بفرست.\n"
+        "وقتی تموم شد، /donelist رو بزن."
     )
 
 
@@ -529,8 +547,16 @@ def _list_keyboard(list_id, items):
     for it in items:
         mark = "✅" if it["bought"] else "◻️"
         buttons.append([InlineKeyboardButton(f"{mark} {it['item_name']}", callback_data=f"toggle:{list_id}:{it['id']}")])
-    buttons.append([InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")])
+    buttons.append([InlineKeyboardButton("➕ افزودن آیتم", callback_data="m:list:add")])
+    buttons.append([InlineKeyboardButton("🆕 لیست کاملاً جدید", callback_data="m:list:new")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _empty_list_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن آیتم", callback_data="m:list:add")],
+        [InlineKeyboardButton("🆕 لیست کاملاً جدید", callback_data="m:list:new")],
+    ])
 
 
 @require_household
@@ -544,7 +570,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household
         return
     items = db.get_list_items(active["id"])
     if not items:
-        await update.message.reply_text("این لیست هنوز آیتمی نداره.")
+        await update.message.reply_text("این لیست هنوز آیتمی نداره.", reply_markup=_empty_list_keyboard())
         return
     remaining = [i for i in items if not i["bought"]]
     text = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
@@ -734,7 +760,7 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return True
         items = db.get_list_items(active["id"])
         if not items:
-            await update.message.reply_text("این لیست هنوز آیتمی نداره.")
+            await update.message.reply_text("این لیست هنوز آیتمی نداره.", reply_markup=_empty_list_keyboard())
             return True
         remaining = [i for i in items if not i["bought"]]
         msg = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
@@ -823,6 +849,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🛒 لیست خرید جدید شروع شد.\n"
             "هر آیتم رو تو یک خط بفرست. وقتی تموم شد، /donelist رو بزن."
+        )
+
+    elif action == "list" and len(parts) > 2 and parts[2] == "add":
+        active = db.get_active_list(household_id)
+        list_id = active["id"] if active else db.create_shopping_list(household_id)
+        context.chat_data["collecting_list_id"] = list_id
+        await query.edit_message_text(
+            "➕ حالت افزودن آیتم فعال شد. هر آیتم رو تو یک خط بفرست.\n"
+            "وقتی تموم شد، /donelist رو بزن."
         )
 
 
@@ -1178,6 +1213,7 @@ async def _post_init(application: Application):
         BotCommand("report", "گزارش دسته‌بندی‌شده"),
         BotCommand("transactions", "تراکنش‌های اخیر (حذف/ویرایش)"),
         BotCommand("newlist", "لیست خرید جدید"),
+        BotCommand("additems", "افزودن آیتم به لیست فعلی"),
         BotCommand("list", "نمایش لیست خرید"),
         BotCommand("currency", "تغییر واحد پول"),
         BotCommand("categories", "دسته‌بندی‌ها"),
@@ -1210,6 +1246,7 @@ def main():
     app.add_handler(CommandHandler("categories", categories_cmd))
     app.add_handler(CommandHandler("currency", currency_cmd))
     app.add_handler(CommandHandler("newlist", newlist_cmd))
+    app.add_handler(CommandHandler("additems", additems_cmd))
     app.add_handler(CommandHandler("donelist", donelist_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
 
