@@ -226,6 +226,19 @@ async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- بودجه و تراکنش‌ها ----------------
 
+def _budget_followup_prompt(household_id, context):
+    """بعد از تنظیم بازه بودجه، بلافاصله (همون‌جا، بدون نیاز به رفتن سراغ منوی جدا) مبلغ بودجه رو هم می‌پرسه."""
+    context.chat_data["awaiting"] = "budget"
+    cur = db.get_currency(household_id)
+    current = db.get_budget(household_id)
+    label = _period_label(household_id)
+    current_line = f"(بودجه فعلی {label}: {fmt(current, cur)})\n" if current else ""
+    return (
+        f"{current_line}حالا مبلغ بودجه {label} رو بفرست (مثلاً 5000000)"
+        " — یا اگه فعلاً نمی‌خوای عوضش کنی، بنویس «-»."
+    )
+
+
 @require_household
 async def period_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     if not context.args:
@@ -241,7 +254,8 @@ async def period_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
     mode = context.args[0].lower()
     if mode in ("monthly", "ماهانه", "ماه"):
         db.set_budget_period(household_id, "monthly")
-        await update.message.reply_text("✅ بازه بودجه روی «ماهانه» تنظیم شد.")
+        prompt = _budget_followup_prompt(household_id, context)
+        await update.message.reply_text(f"✅ بازه بودجه روی «ماهانه» تنظیم شد.\n\n{prompt}")
         return
     if mode in ("weekly", "هفتگی", "هفته"):
         rest = " ".join(context.args[1:])
@@ -257,7 +271,10 @@ async def period_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
             return
         db.set_budget_period(household_id, "weekly", week_start_weekday=weekday_idx)
         day_name = db.WEEKDAY_FA_NAMES[weekday_idx]
-        await update.message.reply_text(f"✅ بازه بودجه روی «هفتگی» تنظیم شد؛ هر هفته از روز {day_name} شروع می‌شه.")
+        prompt = _budget_followup_prompt(household_id, context)
+        await update.message.reply_text(
+            f"✅ بازه بودجه روی «هفتگی» تنظیم شد؛ هر هفته از روز {day_name} شروع می‌شه.\n\n{prompt}"
+        )
         return
     await update.message.reply_text("فرمت درست: /period monthly  یا  /period weekly دوشنبه")
 
@@ -853,7 +870,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "period" and len(parts) > 2 and parts[2] == "monthly":
         db.set_budget_period(household_id, "monthly")
-        await query.edit_message_text("✅ بازه بودجه روی «ماهانه» تنظیم شد.")
+        prompt = _budget_followup_prompt(household_id, context)
+        await query.edit_message_text(f"✅ بازه بودجه روی «ماهانه» تنظیم شد.\n\n{prompt}")
 
     elif action == "period" and len(parts) > 2 and parts[2] == "weekly":
         context.chat_data["awaiting"] = "week_start"
@@ -915,6 +933,9 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         await _register_income(update, household_id, text)
         return
     if awaiting == "budget":
+        if text.strip().lower() in SKIP_WORDS:
+            await update.message.reply_text("باشه، بودجه فعلی دست‌نخورده موند.")
+            return
         cur = db.get_currency(household_id)
         reply = _apply_budget_input_and_reply_text(household_id, text, cur)
         if reply is None:
@@ -939,9 +960,9 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
             return
         db.set_budget_period(household_id, "weekly", week_start_weekday=weekday_idx)
         day_name = db.WEEKDAY_FA_NAMES[weekday_idx]
+        prompt = _budget_followup_prompt(household_id, context)
         await update.message.reply_text(
-            f"✅ بازه بودجه روی «هفتگی» تنظیم شد؛ هر هفته از روز {day_name} شروع می‌شه.\n"
-            "حالا بودجه هفتگی رو تنظیم کن، مثلاً: /budget 1000000"
+            f"✅ بازه بودجه روی «هفتگی» تنظیم شد؛ هر هفته از روز {day_name} شروع می‌شه.\n\n{prompt}"
         )
         return
     if awaiting == "edit_tx_amount":
