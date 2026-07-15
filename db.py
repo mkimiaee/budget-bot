@@ -160,6 +160,13 @@ def _new_invite_code():
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
+def count_households():
+    """تعداد کل خانواده‌های ساخته‌شده در دیتابیس (برای تشخیص «اولین کاربر ربات» در حالت bootstrap)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) c FROM households").fetchone()
+        return row["c"]
+
+
 def get_user_household(telegram_id):
     with get_conn() as conn:
         row = conn.execute("SELECT household_id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()

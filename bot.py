@@ -39,6 +39,13 @@ logger = logging.getLogger("budget-bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# اگه ست بشه، فقط همین آیدی تلگرام اجازه داره با /start مستقیم برای خودش حساب خانواده جدید بسازه؛
+# بقیه باید حتماً کد دعوت داشته باشن و با /join وارد بشن. این جلوی این رو می‌گیره که اگه لینک ربات
+# دست کس دیگه‌ای افتاد، بدون اجازه صاحب ربات بتونه ازش استفاده کنه.
+# اگه ست نشه، اولین نفری که تا حالا اصلاً هیچ خانواده‌ای تو دیتابیس نساخته، خودکار صاحب ربات می‌شه
+# (حالت راه‌اندازی اولیه) — و باید بعد از اون آیدی‌ش رو تو .env بذاره تا این حالت بسته بشه.
+OWNER_TELEGRAM_ID = os.environ.get("OWNER_TELEGRAM_ID")
+
 
 # واحدهایی که سنتاً بدون اعشار نوشته می‌شوند (چون ارزش اسمی‌شون خیلی بزرگه و اعشار بی‌معنیه)
 NO_DECIMAL_CURRENCIES = {"تومان", "ریال"}
@@ -137,18 +144,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MAIN_MENU_KEYBOARD,
         )
         return
+
+    # کاربر کاملاً جدیده و هنوز هیچ خانواده‌ای نداره. فقط صاحب ربات (یا — اگه هنوز صاحبی تنظیم نشده —
+    # اولین نفری که تا حالا هیچ‌کس خانواده‌ای نساخته) اجازه داره مستقیم با /start حساب جدید بسازه.
+    # بقیه باید کد دعوت داشته باشن و با /join وارد بشن؛ این جلوی استفاده افراد ناخواسته از ربات رو می‌گیره.
+    is_owner = OWNER_TELEGRAM_ID is not None and str(user.id) == str(OWNER_TELEGRAM_ID).strip()
+    is_bootstrap = OWNER_TELEGRAM_ID is None and db.count_households() == 0
+
+    if not (is_owner or is_bootstrap):
+        await update.message.reply_text(
+            "👋 سلام! این ربات خصوصیه و فقط با کد دعوت قابل استفاده‌ست.\n"
+            "کد دعوت رو از صاحب ربات بگیر، بعد بزن:\n"
+            "`/join CODE`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     household_id, code = db.create_household_and_user(user.id, user.first_name)
     currency = db.get_currency(household_id)
+    owner_note = ""
+    if OWNER_TELEGRAM_ID is None:
+        owner_note = (
+            f"\n🔒 برای اینکه از این به بعد فقط خودت بتونی با /start حساب جدید بسازی (و کس دیگه‌ای بدون "
+            f"کد دعوت نتونه از ربات استفاده کنه)، آیدی تلگرامت (`{user.id}`) رو تو فایل `.env` این‌طوری اضافه کن:\n"
+            f"`OWNER_TELEGRAM_ID={user.id}`\n"
+            "و ربات رو ری‌استارت کن.\n"
+        )
     await update.message.reply_text(
         f"سلام {user.first_name}! خوش اومدی 👋\n\n"
         f"یک حساب خانواده برات ساختم. کد دعوت: `{code}`\n"
         "این کد رو به بقیه اعضای خانواده بده تا با دستور زیر بهت ملحق بشن:\n"
         f"`/join {code}`\n\n"
-        f"واحد پول فعلاً روی «{currency}» تنظیمه. از منوی ⚙️ تنظیمات می‌تونی عوضش کنی.\n\n"
+        f"واحد پول فعلاً روی «{currency}» تنظیمه. از منوی ⚙️ تنظیمات می‌تونی عوضش کنی."
+        f"{owner_note}\n"
         "از منوی پایین صفحه استفاده کن، یا برای شروع بودجه ماه رو بزن:\n"
         "`/budget 5000000`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"آیدی تلگرام شما: `{update.effective_user.id}`", parse_mode=ParseMode.MARKDOWN
     )
 
 
@@ -176,7 +214,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/categories — نمایش دسته‌بندی‌ها\n"
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
         "/invite — گرفتن کد دعوت خانواده\n"
-        "/join <کد> — پیوستن به خانواده‌ای دیگر\n\n"
+        "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
+        "/whoami — دیدن آیدی تلگرام خودت (برای تنظیم OWNER_TELEGRAM_ID)\n\n"
         "📷 عکس فاکتور یا 📄 فایل PDF فاکتور بفرست تا خودکار با لیست خریدت تطبیق داده بشه و هزینه‌ها ثبت بشن.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
@@ -1205,6 +1244,7 @@ async def _post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("menu", "باز کردن منوی اصلی"),
         BotCommand("start", "شروع / ساخت حساب خانواده"),
+        BotCommand("whoami", "دیدن آیدی تلگرام خودت"),
         BotCommand("balance", "باقیمانده بودجه"),
         BotCommand("budget", "تنظیم بودجه بازه جاری"),
         BotCommand("period", "بازه بودجه: هفتگی یا ماهانه"),
@@ -1232,6 +1272,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("invite", invite_cmd))
