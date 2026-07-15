@@ -254,6 +254,20 @@ def set_budget_period(household_id, period_type, week_start_weekday=None):
             "UPDATE households SET budget_period=?, week_start_weekday=? WHERE id=?",
             (period_type, week_start_weekday, household_id),
         )
+    # هر بودجه با یک period_key مشخص (مثل '2026-07' یا تاریخ شروع هفته) ذخیره می‌شه. عوض‌کردن بازه
+    # (ماهانه/هفتگی یا روز شروع هفته) باعث می‌شه period_key فعلی عوض بشه، و بودجه‌ای که قبلاً برای
+    # period_key قدیمی ثبت شده بود دیگه پیدا نشه (انگار پاک شده، هرچند واقعاً تو دیتابیس هست).
+    # برای جلوگیری از این «گم‌شدن» — چه کاربر اول بودجه رو بزنه بعد بازه رو عوض کنه، چه برعکس —
+    # اگه برای بازه‌ی تازه هنوز بودجه‌ای ثبت نشده، آخرین مبلغ بودجه‌ای که ثبت کرده بود رو خودکار
+    # به بازه جدید هم منتقل می‌کنیم.
+    if get_budget(household_id) is None:
+        with get_conn() as conn:
+            last = conn.execute(
+                "SELECT amount FROM budgets WHERE household_id=? ORDER BY id DESC LIMIT 1",
+                (household_id,),
+            ).fetchone()
+        if last is not None:
+            set_budget(household_id, last["amount"])
 
 
 def get_current_period_bounds(household_id, ref_date=None):

@@ -90,21 +90,13 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 def _settings_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 تنظیم بودجه", callback_data="m:budget")],
-        [InlineKeyboardButton("📅 بازه بودجه (هفتگی/ماهانه)", callback_data="m:period")],
+        [InlineKeyboardButton("💰📅 بودجه و بازه زمانی", callback_data="m:budgetperiod")],
         [InlineKeyboardButton("💱 تغییر واحد پول", callback_data="m:currency")],
         [InlineKeyboardButton("📁 دسته‌بندی‌ها", callback_data="m:categories")],
         [InlineKeyboardButton("🧾 تراکنش‌های اخیر (حذف/ویرایش)", callback_data="tx:list")],
         [InlineKeyboardButton("🔄 محاسبه مجدد بودجه و هزینه‌ها", callback_data="m:recalc")],
         [InlineKeyboardButton("🔗 کد دعوت خانواده", callback_data="m:invite")],
     ])
-
-
-def _period_choice_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("ماهانه", callback_data="m:period:monthly"),
-        InlineKeyboardButton("هفتگی", callback_data="m:period:weekly"),
-    ]])
 
 
 def _period_label(household_id):
@@ -1014,25 +1006,26 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
 
-    if action == "budget":
-        context.chat_data["awaiting"] = "budget"
+    if action == "budgetperiod":
         label = _period_label(household_id)
         cur = db.get_currency(household_id)
         current = db.get_budget(household_id)
-        current_line = f"بودجه فعلی {label}: {fmt(current, cur)}\n\n" if current else ""
+        budget_line = f"بودجه فعلی: {fmt(current, cur)}\n" if current else "بودجه‌ای هنوز تنظیم نشده.\n"
         await query.edit_message_text(
-            f"{current_line}"
-            f"⚠️ اگه یه عدد ساده بفرستی (مثلاً 5000000)، بودجه {label} کاملاً با همون عدد جایگزین می‌شه (نه اضافه).\n"
-            "اگه فقط می‌خوای به بودجه فعلی اضافه/کم کنی، با علامت +/- بفرست (مثلاً +500000 یا -200000)."
+            f"📅 بازه فعلی: {label}\n{budget_line}\n"
+            "می‌خوای بازه رو عوض کنی یا همینو نگه داری؟ (بعد از انتخاب بازه، بلافاصله مبلغ بودجه رو هم می‌پرسم — نیاز نیست جدا سراغش بری)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ همین بازه — فقط بودجه رو تنظیم کن", callback_data="m:budgetonly")],
+                [
+                    InlineKeyboardButton("📅 ماهانه", callback_data="m:period:monthly"),
+                    InlineKeyboardButton("📅 هفتگی", callback_data="m:period:weekly"),
+                ],
+            ]),
         )
 
-    elif action == "period" and len(parts) == 2:
-        p = db.get_budget_period(household_id)
-        current = "ماهانه" if p["period_type"] == "monthly" else "هفتگی"
-        await query.edit_message_text(
-            f"بازه بودجه فعلی: {current}\nکدوم رو می‌خوای؟",
-            reply_markup=_period_choice_keyboard(),
-        )
+    elif action == "budgetonly":
+        prompt = _budget_followup_prompt(household_id, context)
+        await query.edit_message_text(prompt)
 
     elif action == "period" and len(parts) > 2 and parts[2] == "monthly":
         db.set_budget_period(household_id, "monthly")
