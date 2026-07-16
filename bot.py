@@ -101,10 +101,14 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 def _settings_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰📅 بودجه و بازه زمانی", callback_data="m:budgetperiod")],
+        [InlineKeyboardButton("📁💰 بودجه دسته‌ای", callback_data="m:catbudget")],
         [InlineKeyboardButton("💱 تغییر واحد پول", callback_data="m:currency")],
         [InlineKeyboardButton("📁 دسته‌بندی‌ها", callback_data="m:categories")],
+        [InlineKeyboardButton("🧾 قبض‌های تکرارشونده", callback_data="m:bills")],
         [InlineKeyboardButton("🧾 تراکنش‌های اخیر (حذف/ویرایش)", callback_data="tx:list")],
+        [InlineKeyboardButton("↩️ برگردوندن آخرین تراکنش", callback_data="m:undo")],
         [InlineKeyboardButton("🔄 محاسبه مجدد بودجه و هزینه‌ها", callback_data="m:recalc")],
+        [InlineKeyboardButton("👨‍👩‍👧‍👦 اعضای خانواده", callback_data="m:members")],
         [InlineKeyboardButton("🔗 کد دعوت خانواده", callback_data="m:invite")],
     ])
 
@@ -145,11 +149,18 @@ def _budget_alert_text(household_id, cur):
 
 
 def _report_period_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("امروز", callback_data="m:report:day"),
-        InlineKeyboardButton("این هفته", callback_data="m:report:week"),
-        InlineKeyboardButton("این ماه", callback_data="m:report:month"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("امروز", callback_data="m:report:day"),
+            InlineKeyboardButton("این هفته", callback_data="m:report:week"),
+            InlineKeyboardButton("این ماه", callback_data="m:report:month"),
+        ],
+        [
+            InlineKeyboardButton("📈 نمودار امروز", callback_data="m:chart:day"),
+            InlineKeyboardButton("📈 این هفته", callback_data="m:chart:week"),
+            InlineKeyboardButton("📈 این ماه", callback_data="m:chart:month"),
+        ],
+    ])
 
 
 # ---------------- دستورات پایه ----------------
@@ -1567,7 +1578,88 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("واحد پول جدید رو بفرست، مثلاً: EUR یا یورو یا $")
 
     elif action == "categories":
-        await query.edit_message_text(_categories_text(household_id))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ افزودن دسته", callback_data="m:addcategory")],
+            [InlineKeyboardButton("🗑 حذف دسته", callback_data="m:delcategory")],
+        ])
+        await query.edit_message_text(_categories_text(household_id), reply_markup=kb)
+
+    elif action == "addcategory":
+        context.chat_data["awaiting"] = "addcategory_input"
+        await query.edit_message_text(
+            "اسم دسته جدید رو بفرست؛ اگه می‌خوای کلمات کلیدی هم بدی، با | جدا کن.\n"
+            "مثال: آرایشگاه | ارایشگاه,سلمانی,اصلاح"
+        )
+
+    elif action == "delcategory":
+        cats = db.get_household_only_categories(household_id)
+        if not cats:
+            await query.edit_message_text(
+                "دسته اختصاصی‌ای برای این خانواده نداری (فقط دسته‌های پیش‌فرض هستن که قابل حذف نیستن)."
+            )
+            return
+        buttons = [[InlineKeyboardButton(f"🗑 {c['name']}", callback_data=f"delcat:{c['id']}")] for c in cats]
+        await query.edit_message_text("کدوم دسته حذف بشه؟", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "catbudget":
+        cur = db.get_currency(household_id)
+        rows = db.get_category_budgets_with_spent(household_id)
+        lines = [f"📁 بودجه دسته‌ها ({_period_label(household_id)}):\n"]
+        if not rows:
+            lines.append("هنوز بودجه‌ای برای هیچ دسته‌ای تنظیم نشده.")
+        else:
+            for r in rows:
+                icon = " 🔴" if r["remaining"] < 0 else ""
+                lines.append(f"• {r['category']}: {fmt(r['spent'], cur)} / {fmt(r['budget'], cur)} (باقی: {fmt(r['remaining'], cur)}){icon}")
+        context.chat_data["awaiting"] = "catbudget_input"
+        lines.append("\n✏️ برای تنظیم/تغییر یه دسته، بفرست: <نام دسته> | <مبلغ>\nمثال: خوار و بار | 3000000\nبرای حذف، مبلغ رو 0 بفرست.")
+        await query.edit_message_text("\n".join(lines))
+
+    elif action == "bills":
+        bills = db.get_recurring_bills(household_id)
+        if not bills:
+            await query.edit_message_text(
+                "هنوز قبض تکرارشونده‌ای تعریف نکردی.\n"
+                "فرمت: /addbill <نام قبض> | <مبلغ پیش‌فرض>\nمثال: /addbill قبض برق | 350000"
+            )
+            return
+        await query.edit_message_text(
+            "🧾 قبض‌های تکرارشونده — بزن تا با مبلغ پیش‌فرض، به‌عنوان هزینه جانبی امروز ثبت بشه:",
+            reply_markup=_bills_keyboard(bills),
+        )
+
+    elif action == "undo":
+        tx = db.get_last_transaction(household_id)
+        if not tx:
+            await query.edit_message_text("تراکنشی برای برگردوندن پیدا نشد.")
+            return
+        cur = db.get_currency(household_id)
+        db.delete_transaction(tx["id"])
+        type_label = "هزینه" if tx["type"] == "expense" else "درآمد"
+        desc = tx["description"] or tx["category"] or "—"
+        note = ""
+        if tx.get("receipt_id"):
+            note = "\n(این آیتم بخشی از یه فاکتور بود؛ اگه می‌خوای کل فاکتور رو حذف کنی، از تراکنش‌های اخیر استفاده کن.)"
+        await query.edit_message_text(
+            f"↩️ آخرین تراکنش برگردونده شد: {type_label} {fmt(tx['amount'], cur)} — {desc} (تاریخ {tx['tx_date']}){note}"
+        )
+
+    elif action == "members":
+        members = db.get_household_members(household_id)
+        owner_id = db.get_owner_id(household_id)
+        is_owner = db.is_household_owner(household_id, update.effective_user.id)
+        lines = ["👨‍👩‍👧‍👦 اعضای خانواده:\n"]
+        buttons = []
+        for m in members:
+            label = m["display_name"] or str(m["telegram_id"])
+            tag = " 👑 (ادمین)" if m["telegram_id"] == owner_id else ""
+            lines.append(f"• {label}{tag}")
+            if is_owner and m["telegram_id"] != owner_id:
+                buttons.append([InlineKeyboardButton(f"🗑 حذف {label}", callback_data=f"member:remove:{m['telegram_id']}")])
+        if not is_owner:
+            lines.append("\nفقط ادمین خانواده می‌تونه عضو حذف کنه.")
+        kb = InlineKeyboardMarkup(buttons) if buttons else None
+        await query.edit_message_text("\n".join(lines), reply_markup=kb)
 
     elif action == "invite":
         if not db.is_household_owner(household_id, update.effective_user.id):
@@ -1580,6 +1672,26 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "recalc":
         await query.edit_message_text(_recalc_text(household_id), reply_markup=_settings_keyboard())
+
+    elif action == "chart" and len(parts) > 2:
+        if not CHART_AVAILABLE:
+            await query.edit_message_text("رسم نمودار روی این سرور فعال نیست (matplotlib نصب نشده).")
+            return
+        period_map = {"day": "day", "week": "week", "month": "month"}
+        period = period_map.get(parts[2], "month")
+        rows = db.get_category_totals(household_id, period)
+        title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+        if not rows:
+            await query.answer(f"هزینه‌ای برای {title} ثبت نشده که نمودارش رو بکشم.", show_alert=True)
+            return
+        cur = db.get_currency(household_id)
+        total = sum(r["total"] for r in rows)
+        caption_lines = [f"📊 هزینه‌ها بر اساس دسته — {title}\n"]
+        for i, r in enumerate(rows, 1):
+            pct = (r["total"] / total * 100) if total else 0
+            caption_lines.append(f"{i}. {r['category']} — {fmt(r['total'], cur)} ({pct:.0f}٪)")
+        chart_buf = _generate_category_pie_chart(rows)
+        await query.message.reply_photo(photo=chart_buf, caption="\n".join(caption_lines))
 
     elif action == "report" and len(parts) > 2:
         period = parts[2]
@@ -1671,6 +1783,42 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
     if awaiting == "currency":
         new_currency = db.set_currency(household_id, text)
         await update.message.reply_text(f"✅ واحد پول روی «{new_currency}» تنظیم شد.")
+        return
+    if awaiting == "addcategory_input":
+        raw = text.strip()
+        if "|" in raw:
+            name, kw = raw.split("|", 1)
+            name, kw = name.strip(), kw.strip()
+        else:
+            name, kw = raw, ""
+        if not name:
+            await update.message.reply_text("اسم دسته نمی‌تونه خالی باشه. دوباره بفرست: <نام دسته> | <کلمات کلیدی (اختیاری)>")
+            context.chat_data["awaiting"] = "addcategory_input"
+            return
+        db.add_category(household_id, name, kw)
+        await update.message.reply_text(f"✅ دسته «{name}» اضافه شد.")
+        return
+    if awaiting == "catbudget_input":
+        raw = text.strip()
+        if "|" not in raw:
+            await update.message.reply_text("فرمت درست: <نام دسته> | <مبلغ>\nمثال: خوار و بار | 3000000")
+            context.chat_data["awaiting"] = "catbudget_input"
+            return
+        cat_name, amount_str = raw.split("|", 1)
+        cat_name = cat_name.strip()
+        amount, _ = categorize.extract_amount(amount_str.strip())
+        if not cat_name or amount is None:
+            await update.message.reply_text("فرمت درست: <نام دسته> | <مبلغ>\nمثال: خوار و بار | 3000000")
+            context.chat_data["awaiting"] = "catbudget_input"
+            return
+        db.set_category_budget(household_id, cat_name, amount)
+        cur = db.get_currency(household_id)
+        if amount <= 0:
+            await update.message.reply_text(f"✅ بودجه دسته «{cat_name}» حذف شد.")
+        else:
+            await update.message.reply_text(
+                f"✅ بودجه دسته «{cat_name}» برای {_period_label(household_id)} روی {fmt(amount, cur)} تنظیم شد."
+            )
         return
     if awaiting == "week_start":
         weekday_idx = categorize.parse_week_start_input(text)
