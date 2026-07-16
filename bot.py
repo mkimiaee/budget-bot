@@ -703,16 +703,29 @@ async def recalc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
     await update.message.reply_text(_recalc_text(household_id))
 
 
-def _report_label(g):
-    """هزینه‌های جانبی (قبض و غیره) با آیکن 📎 مشخص می‌شن تا از هزینه‌های داخل بودجه جدا دیده بشن."""
-    prefix = "📎 " if not g.get("in_budget", 1) else ""
-    return prefix + g["label"]
+def _render_report_groups(groups, cur, period):
+    lines = []
+    if period == "day":
+        for i, g in enumerate(groups, 1):
+            lines.append(f"{i}. {g['label']} — {fmt(g['amount'], cur)}")
+    else:
+        current_date, idx = None, 0
+        for g in groups:
+            if g["tx_date"] != current_date:
+                if current_date is not None:
+                    lines.append("")
+                lines.append(f"📅 {g['tx_date']}")
+                current_date, idx = g["tx_date"], 0
+            idx += 1
+            lines.append(f"  {idx}. {g['label']} — {fmt(g['amount'], cur)}")
+    return lines
 
 
 def _report_text(household_id, period):
     """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
     ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز).
-    هزینه‌های جانبی (قبض و غیره) توی همون لیست می‌مونن ولی با آیکن 📎 و جمع جداگانه مشخص می‌شن."""
+    هزینه‌های جانبی (قبض و غیره) کاملاً از هزینه‌های داخل بودجه جدا می‌شن و بعد از جمع‌بندی
+    هزینه‌های اصلی، تو یه بخش مجزا با عنوان و آیکن خودشون لیست می‌شن."""
     cur = db.get_currency(household_id)
     period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
     period = period_map.get(period, "month")
@@ -721,26 +734,24 @@ def _report_text(household_id, period):
     if not r["groups"]:
         return f"هیچ هزینه‌ای برای {title} ثبت نشده."
 
+    budget_groups = [g for g in r["groups"] if g.get("in_budget", 1)]
+    side_groups = [g for g in r["groups"] if not g.get("in_budget", 1)]
+
     lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
-    if period == "day":
-        for i, g in enumerate(r["groups"], 1):
-            lines.append(f"{i}. {_report_label(g)} — {fmt(g['amount'], cur)}")
+    if budget_groups:
+        lines.extend(_render_report_groups(budget_groups, cur, period))
     else:
-        current_date, idx = None, 0
-        for g in r["groups"]:
-            if g["tx_date"] != current_date:
-                if current_date is not None:
-                    lines.append("")
-                lines.append(f"📅 {g['tx_date']}")
-                current_date, idx = g["tx_date"], 0
-            idx += 1
-            lines.append(f"  {idx}. {_report_label(g)} — {fmt(g['amount'], cur)}")
+        lines.append("(هزینه‌ای داخل بودجه ثبت نشده)")
 
     lines.append(f"\nجمع {title} (داخل بودجه): {fmt(r['total'], cur)}")
-    if r.get("side_total"):
-        lines.append(f"📎 جمع هزینه‌های جانبی (خارج از بودجه): {fmt(r['side_total'], cur)}")
     if period != "day":
         lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
+
+    if side_groups:
+        lines.append("\n📎 هزینه‌های جانبی (خارج از بودجه)")
+        lines.extend(_render_report_groups(side_groups, cur, period))
+        lines.append(f"\nجمع هزینه‌های جانبی: {fmt(r['side_total'], cur)}")
+
     return "\n".join(lines)
 
 
