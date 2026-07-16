@@ -649,9 +649,32 @@ def _list_keyboard(list_id, items):
     buttons = []
     for it in items:
         mark = "✅" if it["bought"] else "◻️"
-        buttons.append([InlineKeyboardButton(f"{mark} {it['item_name']}", callback_data=f"toggle:{list_id}:{it['id']}")])
+        buttons.append([
+            InlineKeyboardButton(f"{mark} {it['item_name']}", callback_data=f"toggle:{list_id}:{it['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"delitem:{list_id}:{it['id']}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ افزودن آیتم", callback_data=f"m:list:additems:{list_id}")])
+    buttons.append([InlineKeyboardButton("🗑 حذف کل لیست", callback_data=f"m:list:delall:{list_id}")])
     buttons.append([InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _list_status_text(list_id):
+    """متن و کیبورد فعلی یک لیست خرید را برمی‌گرداند (برای بازسازی پیام بعد از یک عملیات)."""
+    lst = db.get_list_by_id(list_id)
+    name = lst["name"] if lst else "لیست خرید"
+    items = db.get_list_items(list_id)
+    if not items:
+        text = f"🛒 {name} — این لیست هیچ آیتمی نداره."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ افزودن آیتم", callback_data=f"m:list:additems:{list_id}")],
+            [InlineKeyboardButton("🗑 حذف کل لیست", callback_data=f"m:list:delall:{list_id}")],
+            [InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")],
+        ])
+        return text, keyboard
+    remaining = [i for i in items if not i["bought"]]
+    text = f"🛒 {name} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
+    return text, _list_keyboard(list_id, items)
 
 
 @require_household
@@ -663,13 +686,8 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")]]),
         )
         return
-    items = db.get_list_items(active["id"])
-    if not items:
-        await update.message.reply_text("این لیست هنوز آیتمی نداره.")
-        return
-    remaining = [i for i in items if not i["bought"]]
-    text = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
-    await update.message.reply_text(text, reply_markup=_list_keyboard(active["id"], items))
+    text, keyboard = _list_status_text(active["id"])
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,12 +700,19 @@ async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not item:
         return
     db.mark_item_bought(item_id, bought=not item["bought"])
-    items = db.get_list_items(list_id)
-    remaining = [i for i in items if not i["bought"]]
-    active = db.get_active_list(db.get_user_household(update.effective_user.id))
-    name = active["name"] if active else "لیست خرید"
-    text = f"🛒 {name} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
-    await query.edit_message_text(text, reply_markup=_list_keyboard(list_id, items))
+    text, keyboard = _list_status_text(list_id)
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def delitem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف یک آیتم مشخص از لیست خرید (دکمه 🗑 کنار هر آیتم)."""
+    query = update.callback_query
+    await query.answer("آیتم حذف شد")
+    _, list_id, item_id = query.data.split(":")
+    list_id, item_id = int(list_id), int(item_id)
+    db.delete_list_item(item_id)
+    text, keyboard = _list_status_text(list_id)
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 # ---------------- مدیریت تراکنش‌ها (حذف/ویرایش هزینه یا درآمد) ----------------
@@ -965,13 +990,8 @@ async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")]]),
             )
             return True
-        items = db.get_list_items(active["id"])
-        if not items:
-            await update.message.reply_text("این لیست هنوز آیتمی نداره.")
-            return True
-        remaining = [i for i in items if not i["bought"]]
-        msg = f"🛒 {active['name']} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
-        await update.message.reply_text(msg, reply_markup=_list_keyboard(active["id"], items))
+        msg, keyboard = _list_status_text(active["id"])
+        await update.message.reply_text(msg, reply_markup=keyboard)
         return True
 
     if text == BTN_REPORT:
@@ -1067,6 +1087,41 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "هر آیتم رو تو یک خط بفرست. وقتی تموم شد، /donelist رو بزن."
         )
 
+    elif action == "list" and len(parts) > 3 and parts[2] == "additems":
+        list_id = int(parts[3])
+        context.chat_data["collecting_list_id"] = list_id
+        await query.edit_message_text(
+            "➕ هر آیتم جدید رو تو یک خط بفرست (می‌تونی چند خط با هم هم بفرستی).\n"
+            "وقتی تموم شد، /donelist رو بزن یا دوباره روی «🛒 لیست خرید» بزن."
+        )
+
+    elif action == "list" and len(parts) > 3 and parts[2] == "delall":
+        list_id = int(parts[3])
+        lst = db.get_list_by_id(list_id)
+        name = lst["name"] if lst else "این لیست"
+        await query.edit_message_text(
+            f"⚠️ مطمئنی می‌خوای «{name}» رو کامل حذف کنی؟ این کار قابل بازگشت نیست.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ بله، حذفش کن", callback_data=f"m:list:delallconfirm:{list_id}")],
+                [InlineKeyboardButton("❌ نه، بی‌خیال", callback_data=f"m:list:delallcancel:{list_id}")],
+            ]),
+        )
+
+    elif action == "list" and len(parts) > 3 and parts[2] == "delallconfirm":
+        list_id = int(parts[3])
+        db.delete_shopping_list(list_id)
+        if context.chat_data.get("collecting_list_id") == list_id:
+            context.chat_data.pop("collecting_list_id", None)
+        await query.edit_message_text(
+            "🗑 لیست خرید کامل حذف شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")]]),
+        )
+
+    elif action == "list" and len(parts) > 3 and parts[2] == "delallcancel":
+        list_id = int(parts[3])
+        text, keyboard = _list_status_text(list_id)
+        await query.edit_message_text(text, reply_markup=keyboard)
+
 
 # ---------------- پیام آزاد و عکس فاکتور ----------------
 
@@ -1075,8 +1130,10 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
     text = update.message.text.strip()
 
     # حالت ۱: در حال تکمیل یک لیست خرید هستیم
+    # نکته: اگه متن دقیقاً یکی از دکمه‌های منوی اصلی باشه (مثلاً کاربر زده روی «لیست خرید»
+    # تا وضعیت لیست رو ببینه)، نباید به‌عنوان یک آیتم اضافه بشه؛ باید به منو مسیریابی بشه.
     list_id = context.chat_data.get("collecting_list_id")
-    if list_id:
+    if list_id and text not in MAIN_MENU_LABELS:
         lines = [l for l in text.splitlines() if l.strip()]
         db.add_list_items(list_id, lines)
         await update.message.reply_text(f"➕ {len(lines)} آیتم به لیست اضافه شد. بازم بفرست یا /donelist بزن.")
@@ -1496,6 +1553,7 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
 
     app.add_handler(CallbackQueryHandler(toggle_callback, pattern=r"^toggle:"))
+    app.add_handler(CallbackQueryHandler(delitem_callback, pattern=r"^delitem:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(tx_callback, pattern=r"^tx:"))
     app.add_handler(CallbackQueryHandler(exp_callback, pattern=r"^exp:"))

@@ -541,6 +541,14 @@ def get_active_list(household_id):
         return dict(row) if row else None
 
 
+def get_list_by_id(list_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM shopping_lists WHERE id=?", (list_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def add_list_items(list_id, item_names):
     with get_conn() as conn:
         for item in item_names:
@@ -566,6 +574,17 @@ def mark_item_bought(item_id, bought=True, price=None):
             "UPDATE shopping_list_items SET bought=?, matched_price=COALESCE(?, matched_price) WHERE id=?",
             (1 if bought else 0, price, item_id),
         )
+
+
+def delete_list_item(item_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM shopping_list_items WHERE id=?", (item_id,))
+
+
+def delete_shopping_list(list_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM shopping_list_items WHERE list_id=?", (list_id,))
+        conn.execute("DELETE FROM shopping_lists WHERE id=?", (list_id,))
 
 
 def close_list(list_id):
