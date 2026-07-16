@@ -1990,12 +1990,30 @@ def _receipt_store_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
-def _receipt_preview_text_and_keyboard(cur, lines, note=None, store=None):
+def _duplicate_receipt_warning(household_id, store, lines):
+    """اگه فاکتور مشابهی (از نظر جمع مبلغ، فروشگاه، و نزدیکی تاریخ) قبلاً ثبت شده باشه، یه پیام
+    هشدار برمی‌گردونه؛ وگرنه None."""
+    total = sum(l["amount"] for l in lines)
+    if total <= 0:
+        return None
+    match = db.find_similar_receipt(household_id, store, total, date.today())
+    if not match:
+        return None
+    cur = db.get_currency(household_id)
+    store_part = f" از {match['store']}" if match.get("store") else ""
+    return f"⚠️ شبیه یه فاکتور قبلی‌ه: {fmt(match['total'], cur)}{store_part} — تاریخ {match['tx_date']}. قبل از تایید مطمئن شو تکراری نیست."
+
+
+def _receipt_preview_text_and_keyboard(cur, lines, note=None, store=None, household_id=None):
     """پیش‌نمایش آیتم‌های استخراج‌شده از فاکتور، قبل از ثبت نهایی — با دکمه حذف روی هر آیتم اشتباه
     و یک دکمه برای انتخاب فروشگاه (که دسته‌بندی کل فاکتور رو هم مشخص می‌کنه)."""
     body = ["🧾 آیتم‌های تشخیص داده‌شده از فاکتور — قبل از ثبت بررسی کن:"]
     if note:
         body.append(note)
+    if household_id is not None:
+        warning = _duplicate_receipt_warning(household_id, store, lines)
+        if warning:
+            body.append(warning)
     body.append(f"🏪 فروشگاه: {store}" if store else "🏪 فروشگاه: انتخاب نشده")
     body.append("")
     total = 0.0
@@ -2030,7 +2048,7 @@ async def _process_receipt_lines(update: Update, context: ContextTypes.DEFAULT_T
 
     cur = db.get_currency(household_id)
     context.chat_data["receipt_draft"] = {"lines": receipt_lines, "note": note, "store": None}
-    text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note)
+    text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, household_id=household_id)
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -2109,7 +2127,7 @@ async def rcpt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data.pop("receipt_draft", None)
             await query.edit_message_text("همه آیتم‌ها حذف شدن؛ چیزی ثبت نشد.")
             return
-        text, kb = _receipt_preview_text_and_keyboard(cur, lines, draft.get("note"), draft.get("store"))
+        text, kb = _receipt_preview_text_and_keyboard(cur, lines, draft.get("note"), draft.get("store"), household_id=household_id)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2119,12 +2137,12 @@ async def rcpt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "setstore" and len(parts) > 2:
         draft["store"] = parts[2]
-        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"))
+        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"), household_id=household_id)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
     if action == "back":
-        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"))
+        text, kb = _receipt_preview_text_and_keyboard(cur, draft["lines"], draft.get("note"), draft.get("store"), household_id=household_id)
         await query.edit_message_text(text, reply_markup=kb)
         return
 
@@ -2337,7 +2355,7 @@ async def _check_email_for_account(context: ContextTypes.DEFAULT_TYPE, acc) -> i
             if not receipt_lines:
                 continue
             note = f"📧 از ایمیل — {item['subject']}"
-            text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, store="Mercadona")
+            text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, store="Mercadona", household_id=household_id)
             for m in members:
                 chat_id = m["telegram_id"]
                 try:

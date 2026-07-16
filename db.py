@@ -609,6 +609,30 @@ def get_receipt_transactions(household_id, receipt_id):
         return [dict(r) for r in rows]
 
 
+def find_similar_receipt(household_id, store, total_amount, near_date, tolerance_days=3):
+    """قبل از ثبت یه فاکتور جدید (پیش‌نویس)، دنبال یه فاکتور قبلاً ثبت‌شده می‌گرده که جمعش نزدیک
+    همین مبلغه و توی چند روز نزدیک همین تاریخ ثبت شده (و اگه فروشگاه مشخص باشه، فروشگاهش هم یکی باشه)
+    — برای هشدار «شبیه یه فاکتور قبلی‌ه» قبل از تایید نهایی. اگه پیدا نشه None برمی‌گردونه."""
+    with get_conn() as conn:
+        start = (near_date - timedelta(days=tolerance_days)).isoformat()
+        end = (near_date + timedelta(days=tolerance_days)).isoformat()
+        rows = conn.execute(
+            """SELECT receipt_id, store, tx_date, SUM(amount) as total
+               FROM transactions
+               WHERE household_id=? AND type='expense' AND receipt_id IS NOT NULL
+                 AND tx_date BETWEEN ? AND ?
+               GROUP BY receipt_id""",
+            (household_id, start, end),
+        ).fetchall()
+        tolerance = max(total_amount * 0.02, 0.01)
+        for r in rows:
+            if store and r["store"] and r["store"].lower() != store.lower():
+                continue
+            if abs(r["total"] - total_amount) <= tolerance:
+                return dict(r)
+    return None
+
+
 def delete_receipt(household_id, receipt_id):
     """همه ردیف‌های یک فاکتور را یک‌جا حذف می‌کند؛ تعداد ردیف‌های حذف‌شده را برمی‌گرداند."""
     with get_conn() as conn:
