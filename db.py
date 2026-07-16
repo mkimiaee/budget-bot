@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     source TEXT DEFAULT 'manual',  -- 'manual' | 'ocr' | 'list'
     receipt_id TEXT,               -- شناسه مشترک بین همه ردیف‌های یک فاکتور (عکس/PDF) برای حذف دسته‌جمعی
     tx_date TEXT NOT NULL,         -- YYYY-MM-DD (تاریخ خرید، نه لزوما تاریخ ثبت)
+    in_budget INTEGER DEFAULT 1,   -- 1=جزو بودجه (خوراک/هزینه اصلی) | 0=هزینه جانبی (قبض و غیره)، فقط در گزارش
     created_at TEXT NOT NULL,
     FOREIGN KEY (household_id) REFERENCES households(id)
 );
@@ -175,6 +176,9 @@ def init_db():
             conn.execute("ALTER TABLE transactions ADD COLUMN store TEXT")
         if "receipt_id" not in tx_cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN receipt_id TEXT")
+        if "in_budget" not in tx_cols:
+            # تراکنش‌های قدیمی همه جزو بودجه حساب می‌شن (رفتار قبلی دست‌نخورده می‌مونه)
+            conn.execute("ALTER TABLE transactions ADD COLUMN in_budget INTEGER DEFAULT 1")
         # هر دسته پیش‌فرض که هنوز تو دیتابیس نیست رو اضافه کن (نه فقط بار اول) — این‌جوری وقتی بعداً
         # به DEFAULT_CATEGORIES یک دسته جدید اضافه می‌شه (مثل فروشگاه‌های جدید)، با ری‌استارت بعدی ربات
         # خودش به دیتابیس‌های قدیمی هم اضافه می‌شه، بدون اینکه دسته‌های موجود دوباره ساخته/تکرار بشن.
@@ -356,15 +360,16 @@ def get_budget(household_id):
 
 
 def add_transaction(household_id, user_id, tx_type, amount, category=None, description=None,
-                     source="manual", tx_date=None, store=None, receipt_id=None):
+                     source="manual", tx_date=None, store=None, receipt_id=None, in_budget=1):
     tx_date = tx_date or date.today().isoformat()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO transactions
-               (household_id, user_id, type, amount, category, description, store, source, receipt_id, tx_date, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (household_id, user_id, type, amount, category, description, store, source, receipt_id, tx_date,
+                in_budget, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (household_id, user_id, tx_type, amount, category, description, store, source, receipt_id, tx_date,
-             datetime.utcnow().isoformat()),
+             1 if in_budget else 0, datetime.utcnow().isoformat()),
         )
         return cur.lastrowid
 
@@ -432,24 +437,26 @@ def adjust_budget(household_id, delta):
     return new_amount
 
 
-def _sum(conn, household_id, tx_type, start, end):
-    row = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) s FROM transactions WHERE household_id=? AND type=? AND tx_date BETWEEN ? AND ?",
-        (household_id, tx_type, start, end),
-    ).fetchone()
+def _sum(conn, household_id, tx_type, start, end, in_budget_only=False):
+    query = "SELECT COALESCE(SUM(amount),0) s FROM transactions WHERE household_id=? AND type=? AND tx_date BETWEEN ? AND ?"
+    params = [household_id, tx_type, start, end]
+    if in_budget_only:
+        query += " AND in_budget=1"
+    row = conn.execute(query, params).fetchone()
     return row["s"]
 
 
 def get_balance(household_id):
-    """بودجه بازه جاری (ماهانه یا هفتگیِ تنظیم‌شده) منهای هزینه‌ها به‌علاوه درآمدهای همان بازه"""
+    """بودجه بازه جاری (ماهانه یا هفتگیِ تنظیم‌شده) منهای هزینه‌ها به‌علاوه درآمدهای همان بازه.
+    هزینه‌های جانبی (in_budget=0، مثل قبض) اینجا حساب نمی‌شن؛ فقط تو گزارش دیده می‌شن."""
     today = date.today()
     start, end, period_key, period_type = get_current_period_bounds(household_id, today)
 
     budget = get_budget(household_id) or 0.0
     with get_conn() as conn:
-        period_expense = _sum(conn, household_id, "expense", start.isoformat(), end.isoformat())
+        period_expense = _sum(conn, household_id, "expense", start.isoformat(), end.isoformat(), in_budget_only=True)
         period_income = _sum(conn, household_id, "income", start.isoformat(), end.isoformat())
-        day_expense = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat())
+        day_expense = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat(), in_budget_only=True)
 
     remaining = budget + period_income - period_expense
     days_left = (end - today).days + 1  # شامل امروز
@@ -499,21 +506,25 @@ def get_report(household_id, period):
 
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT tx_date, amount, category, description, receipt_id FROM transactions
+            """SELECT tx_date, amount, category, description, receipt_id, in_budget FROM transactions
                WHERE household_id=? AND type='expense' AND tx_date BETWEEN ? AND ?
                ORDER BY tx_date, id""",
             (household_id, start, end),
         ).fetchall()
-        today_total = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat())
+        today_total = _sum(conn, household_id, "expense", today.isoformat(), today.isoformat(), in_budget_only=True)
 
     groups = []
     receipts_by_id = {}
     for r in rows:
         rid = r["receipt_id"]
+        in_budget = 1 if r["in_budget"] is None else r["in_budget"]
         if rid:
             g = receipts_by_id.get(rid)
             if g is None:
-                g = {"tx_date": r["tx_date"], "amount": 0.0, "categories": [], "count": 0, "receipt_id": rid}
+                g = {
+                    "tx_date": r["tx_date"], "amount": 0.0, "categories": [], "count": 0,
+                    "receipt_id": rid, "in_budget": in_budget,
+                }
                 receipts_by_id[rid] = g
                 groups.append(g)
             g["amount"] += r["amount"]
@@ -522,7 +533,7 @@ def get_report(household_id, period):
         else:
             groups.append({
                 "tx_date": r["tx_date"], "amount": r["amount"], "count": 1, "receipt_id": None,
-                "label": r["description"] or r["category"] or "هزینه",
+                "label": r["description"] or r["category"] or "هزینه", "in_budget": in_budget,
             })
 
     for g in groups:
@@ -534,8 +545,13 @@ def get_report(household_id, period):
                 g["label"] = f"{cat_name} ({g['count']} قلم)" if cat_count / g["count"] >= 0.5 else f"خرید ({g['count']} قلم)"
             g.pop("categories", None)
 
-    total = sum(g["amount"] for g in groups)
-    return {"start": start, "end": end, "groups": groups, "total": total, "today_total": today_total}
+    # هزینه‌های جانبی (قبض و غیره) جدا از جمع اصلی بودجه نگه داشته می‌شن، ولی توی همون لیست groups می‌مونن
+    total = sum(g["amount"] for g in groups if g.get("in_budget", 1))
+    side_total = sum(g["amount"] for g in groups if not g.get("in_budget", 1))
+    return {
+        "start": start, "end": end, "groups": groups,
+        "total": total, "side_total": side_total, "today_total": today_total,
+    }
 
 
 def get_categories(household_id):

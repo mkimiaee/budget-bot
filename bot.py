@@ -445,10 +445,17 @@ async def _register_income(update, household_id, text):
 @require_household
 async def expense_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     text = " ".join(context.args)
-    await _register_expense(update, household_id, text, source="manual")
+    await _register_expense(update, context, household_id, text, source="manual")
 
 
-async def _register_expense(update, household_id, text, source="manual"):
+def _in_budget_choice_keyboard(prefix):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍽 داخل بودجه (خوراک/هزینه اصلی)", callback_data=f"exp:{prefix}:1")],
+        [InlineKeyboardButton("📎 هزینه جانبی (قبض و غیره — فقط تو گزارش)", callback_data=f"exp:{prefix}:0")],
+    ])
+
+
+async def _register_expense(update, context, household_id, text, source="manual"):
     cur = db.get_currency(household_id)
     amount, desc, cat, store, tx_date = categorize.parse_free_text_expense_detailed(text, household_id)
     if amount is None:
@@ -456,11 +463,10 @@ async def _register_expense(update, household_id, text, source="manual"):
             "متوجه مبلغ نشدم. مثال: نان 50000  یا  نان 50000 فروشگاه رفاه تاریخ 2026-07-10"
         )
         return None
-    tx_id = db.add_transaction(
-        household_id, update.effective_user.id, "expense", amount,
-        category=cat, description=desc or None, source=source, store=store, tx_date=tx_date,
-    )
-    bal = db.get_balance(household_id)
+    context.chat_data["quick_expense_draft"] = {
+        "amount": amount, "description": desc, "category": cat,
+        "store": store, "tx_date": tx_date, "source": source,
+    }
     extra = []
     if store:
         extra.append(f"فروشگاه: {store}")
@@ -468,10 +474,11 @@ async def _register_expense(update, household_id, text, source="manual"):
         extra.append(f"تاریخ: {tx_date}")
     extra_str = (" — " + " — ".join(extra)) if extra else ""
     await update.message.reply_text(
-        f"✅ هزینه ثبت شد: {fmt(amount, cur)} — {desc or '—'} (دسته: {cat}){extra_str}\n"
-        f"باقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+        f"هزینه: {fmt(amount, cur)} — {desc or '—'} (دسته: {cat}){extra_str}\n"
+        "این هزینه جزو بودجه باشه یا هزینه جانبیه (مثل قبض) که فقط تو گزارش میاد؟",
+        reply_markup=_in_budget_choice_keyboard("quickbudget"),
     )
-    return tx_id
+    return None
 
 
 # ---------------- ثبت هزینه مرحله‌به‌مرحله (وقتی متن آزاد قابل اعتماد نیست) ----------------
@@ -525,21 +532,25 @@ async def _commit_expense_draft(update: Update, context: ContextTypes.DEFAULT_TY
     store = draft.get("store")
     tx_date = draft.get("tx_date") or date.today().isoformat()
     cat = draft.get("category") or (categorize.categorize(desc, household_id) if desc else "متفرقه")
+    in_budget = draft.get("in_budget", 1)
     user_id = update.effective_user.id
 
     db.add_transaction(
         household_id, user_id, "expense", amount,
-        category=cat, description=desc, store=store, tx_date=tx_date, source="manual",
+        category=cat, description=desc, store=store, tx_date=tx_date, source="manual", in_budget=in_budget,
     )
-    bal = db.get_balance(household_id)
     extra = []
     if store:
         extra.append(f"فروشگاه: {store}")
     extra.append(f"تاریخ: {tx_date}")
     extra_str = " — " + " — ".join(extra)
+    if in_budget:
+        bal = db.get_balance(household_id)
+        tail = f"\nباقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+    else:
+        tail = "\n📎 این هزینه جانبیه، جزو بودجه حساب نشد و فقط تو گزارش می‌بینیش."
     text = (
-        f"✅ هزینه ثبت شد: {fmt(amount, cur)} — {desc or '—'} (دسته: {cat}){extra_str}\n"
-        f"باقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+        f"✅ هزینه ثبت شد: {fmt(amount, cur)} — {desc or '—'} (دسته: {cat}){extra_str}{tail}"
     )
     if via_callback:
         await update.callback_query.edit_message_text(text)
@@ -585,6 +596,45 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data["awaiting"] = "expense_date_manual"
             await query.edit_message_text("تاریخ خرید رو بفرست، مثلاً 2026-07-15 یا 15-07-2026:")
 
+    elif action == "inbudget" and len(parts) > 2:
+        # آخرین قدم ثبت هزینه مرحله‌به‌مرحله: آیا جزو بودجه باشه یا هزینه جانبی
+        draft = context.chat_data.get("expense_draft")
+        if not draft or "amount" not in draft:
+            await query.edit_message_text("این فرآیند منقضی شده. دوباره از ➖ ثبت هزینه شروع کن.")
+            return
+        draft["in_budget"] = int(parts[2])
+        await _commit_expense_draft(update, context, household_id, via_callback=True)
+
+    elif action == "quickbudget" and len(parts) > 2:
+        # آخرین قدم ثبت هزینه سریع (تک‌خطی): آیا جزو بودجه باشه یا هزینه جانبی
+        draft = context.chat_data.pop("quick_expense_draft", None)
+        if not draft:
+            await query.edit_message_text("این فرآیند منقضی شده. دوباره هزینه رو بفرست.")
+            return
+        in_budget = int(parts[2])
+        cur = db.get_currency(household_id)
+        db.add_transaction(
+            household_id, update.effective_user.id, "expense", draft["amount"],
+            category=draft["category"], description=draft["description"] or None,
+            source=draft["source"], store=draft["store"], tx_date=draft["tx_date"],
+            in_budget=in_budget,
+        )
+        extra = []
+        if draft["store"]:
+            extra.append(f"فروشگاه: {draft['store']}")
+        if draft["tx_date"]:
+            extra.append(f"تاریخ: {draft['tx_date']}")
+        extra_str = (" — " + " — ".join(extra)) if extra else ""
+        if in_budget:
+            bal = db.get_balance(household_id)
+            tail = f"\nباقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+        else:
+            tail = "\n📎 این هزینه جانبیه، جزو بودجه حساب نشد و فقط تو گزارش می‌بینیش."
+        await query.edit_message_text(
+            f"✅ هزینه ثبت شد: {fmt(draft['amount'], cur)} — {draft['description'] or '—'} "
+            f"(دسته: {draft['category']}){extra_str}{tail}"
+        )
+
 
 async def excat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """انتخاب دسته‌بندی از دکمه‌ها، آخرین قدم ثبت هزینه مرحله‌به‌مرحله (بعد از تاریخ)."""
@@ -610,7 +660,10 @@ async def excat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(names):
             draft["category"] = names[idx]
 
-    await _commit_expense_draft(update, context, household_id, via_callback=True)
+    await query.edit_message_text(
+        "این هزینه جزو بودجه باشه یا هزینه جانبیه (مثل قبض) که فقط تو گزارش میاد؟",
+        reply_markup=_in_budget_choice_keyboard("inbudget"),
+    )
 
 
 def _balance_text(household_id):
@@ -650,9 +703,16 @@ async def recalc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
     await update.message.reply_text(_recalc_text(household_id))
 
 
+def _report_label(g):
+    """هزینه‌های جانبی (قبض و غیره) با آیکن 📎 مشخص می‌شن تا از هزینه‌های داخل بودجه جدا دیده بشن."""
+    prefix = "📎 " if not g.get("in_budget", 1) else ""
+    return prefix + g["label"]
+
+
 def _report_text(household_id, period):
     """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
-    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز)."""
+    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز).
+    هزینه‌های جانبی (قبض و غیره) توی همون لیست می‌مونن ولی با آیکن 📎 و جمع جداگانه مشخص می‌شن."""
     cur = db.get_currency(household_id)
     period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
     period = period_map.get(period, "month")
@@ -664,7 +724,7 @@ def _report_text(household_id, period):
     lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
     if period == "day":
         for i, g in enumerate(r["groups"], 1):
-            lines.append(f"{i}. {g['label']} — {fmt(g['amount'], cur)}")
+            lines.append(f"{i}. {_report_label(g)} — {fmt(g['amount'], cur)}")
     else:
         current_date, idx = None, 0
         for g in r["groups"]:
@@ -674,9 +734,11 @@ def _report_text(household_id, period):
                 lines.append(f"📅 {g['tx_date']}")
                 current_date, idx = g["tx_date"], 0
             idx += 1
-            lines.append(f"  {idx}. {g['label']} — {fmt(g['amount'], cur)}")
+            lines.append(f"  {idx}. {_report_label(g)} — {fmt(g['amount'], cur)}")
 
-    lines.append(f"\nجمع {title}: {fmt(r['total'], cur)}")
+    lines.append(f"\nجمع {title} (داخل بودجه): {fmt(r['total'], cur)}")
+    if r.get("side_total"):
+        lines.append(f"📎 جمع هزینه‌های جانبی (خارج از بودجه): {fmt(r['side_total'], cur)}")
     if period != "day":
         lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
     return "\n".join(lines)
@@ -801,7 +863,10 @@ async def delitem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- مدیریت تراکنش‌ها (حذف/ویرایش هزینه یا درآمد) ----------------
 
 def _tx_summary(tx, cur):
-    type_icon = "➖" if tx["type"] == "expense" else "➕"
+    if tx["type"] == "expense" and not tx.get("in_budget", 1):
+        type_icon = "📎"  # هزینه جانبی (خارج از بودجه)
+    else:
+        type_icon = "➖" if tx["type"] == "expense" else "➕"
     desc = tx["description"] or "—"
     parts = [f"{type_icon} {fmt(tx['amount'], cur)} — {desc}"]
     if tx.get("store"):
@@ -1323,7 +1388,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         return
 
     # حالت ۴ (پیش‌فرض): پیام را به‌عنوان هزینه ثبت کن
-    await _register_expense(update, household_id, text, source="manual")
+    await _register_expense(update, context, household_id, text, source="manual")
 
 
 RECEIPT_STORE_OPTIONS = ["Mercadona", "Consum", "Lidl"]
