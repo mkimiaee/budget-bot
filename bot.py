@@ -2,6 +2,7 @@
 ربات تلگرام دخل‌وخرج خانواده
 اجرا: python bot.py   (نیاز به متغیر محیطی BOT_TOKEN)
 """
+import asyncio
 import logging
 import os
 import shutil
@@ -35,6 +36,7 @@ from telegram.ext import (
 import db
 import categorize
 import ocr
+import mailfetch
 
 try:
     import matplotlib
@@ -105,6 +107,7 @@ def _settings_keyboard():
         [InlineKeyboardButton("💱 تغییر واحد پول", callback_data="m:currency")],
         [InlineKeyboardButton("📁 دسته‌بندی‌ها", callback_data="m:categories")],
         [InlineKeyboardButton("🧾 قبض‌های تکرارشونده", callback_data="m:bills")],
+        [InlineKeyboardButton("📧 اتصال ایمیل فاکتور (Mercadona)", callback_data="m:emailstatus")],
         [InlineKeyboardButton("🧾 تراکنش‌های اخیر (حذف/ویرایش)", callback_data="tx:list")],
         [InlineKeyboardButton("↩️ برگردوندن آخرین تراکنش", callback_data="m:undo")],
         [InlineKeyboardButton("🔄 محاسبه مجدد بودجه و هزینه‌ها", callback_data="m:recalc")],
@@ -229,6 +232,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/invite — گرفتن کد دعوت خانواده (فقط ادمین/سازنده خانواده)\n"
         "/members — نمایش اعضای خانواده (ادمین می‌تونه عضو حذف کنه)\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
+        "/connectemail — اتصال ایمیل جیمیل برای خوندن خودکار فاکتور (فعلاً فقط Mercadona)\n"
+        "/disconnectemail — قطع اتصال ایمیل\n"
         "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n"
         "/restore — بازگردانی دیتابیس از یه فایل بک‌آپ قدیمی (کل دیتابیس فعلی رو جایگزین می‌کنه)\n\n"
         "📷 عکس فاکتور یا 📄 فایل PDF فاکتور بفرست تا خودکار با لیست خریدت تطبیق داده بشه و هزینه‌ها ثبت بشن.",
@@ -296,6 +301,23 @@ async def member_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ عضو از خانواده حذف شد.")
         else:
             await query.edit_message_text("این عضو پیدا نشد (شاید قبلاً حذف شده).")
+
+
+@require_household
+async def connectemail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    context.chat_data["awaiting"] = "connectemail_address"
+    await update.message.reply_text(
+        "📧 آدرس ایمیل جیمیلت رو بفرست (همونی که فاکتورهای Mercadona توش میاد):"
+    )
+
+
+@require_household
+async def disconnectemail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    removed = db.delete_email_account(household_id)
+    if removed:
+        await update.message.reply_text("🔌 اتصال ایمیل قطع شد.")
+    else:
+        await update.message.reply_text("ایمیلی وصل نبود.")
 
 
 @require_household
@@ -1661,6 +1683,27 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup(buttons) if buttons else None
         await query.edit_message_text("\n".join(lines), reply_markup=kb)
 
+    elif action == "emailstatus":
+        acc = db.get_email_account(household_id)
+        if acc:
+            local, _, domain = acc["email_address"].partition("@")
+            masked = f"{local[:3]}***@{domain}" if domain else acc["email_address"]
+            await query.edit_message_text(
+                f"📧 ایمیل وصل‌شده: {masked}\n"
+                f"فیلتر فرستنده: {acc['sender_filter']}\n"
+                "هر ۲۰ دقیقه چک می‌شه و فاکتور جدید رو قبل از ثبت برای تایید می‌فرسته.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔌 قطع اتصال", callback_data="m:disconnectemail")]]),
+            )
+        else:
+            context.chat_data["awaiting"] = "connectemail_address"
+            await query.edit_message_text(
+                "📧 آدرس ایمیل جیمیلت رو بفرست (همونی که فاکتورهای Mercadona توش میاد):"
+            )
+
+    elif action == "disconnectemail":
+        db.delete_email_account(household_id)
+        await query.edit_message_text("🔌 اتصال ایمیل قطع شد.")
+
     elif action == "invite":
         if not db.is_household_owner(household_id, update.effective_user.id):
             owner_name = db.get_owner_display_name(household_id)
@@ -1819,6 +1862,33 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
             await update.message.reply_text(
                 f"✅ بودجه دسته «{cat_name}» برای {_period_label(household_id)} روی {fmt(amount, cur)} تنظیم شد."
             )
+        return
+    if awaiting == "connectemail_address":
+        addr = text.strip()
+        if "@" not in addr:
+            await update.message.reply_text("این یه آدرس ایمیل معتبر به‌نظر نمی‌رسه. دوباره بفرست:")
+            context.chat_data["awaiting"] = "connectemail_address"
+            return
+        context.chat_data["connectemail_draft"] = {"email": addr}
+        context.chat_data["awaiting"] = "connectemail_password"
+        await update.message.reply_text(
+            "حالا App Password جیمیلت رو بفرست (نه رمز اصلی حسابت!).\n"
+            "راهنما: myaccount.google.com/apppasswords → یه رمز ۱۶ رقمی برای Mail بساز و همونو بفرست.\n"
+            "⚠️ بعد از تنظیم، پیشنهاد می‌کنم این پیام رو از تاریخچه چت پاک کنی."
+        )
+        return
+    if awaiting == "connectemail_password":
+        draft = context.chat_data.pop("connectemail_draft", None)
+        if not draft:
+            await update.message.reply_text("این فرآیند منقضی شده. دوباره /connectemail رو بزن.")
+            return
+        app_password = text.strip().replace(" ", "")
+        db.set_email_account(household_id, draft["email"], app_password)
+        await update.message.reply_text(
+            "✅ ایمیل وصل شد. هر ۲۰ دقیقه چک می‌کنم ببینم فاکتور جدیدی از Mercadona اومده یا نه، "
+            "و قبل از ثبت، برای تاییدت می‌فرستم (دقیقاً مثل فاکتوری که خودت عکسش رو می‌فرستی).\n"
+            "برای قطع اتصال: /disconnectemail"
+        )
         return
     if awaiting == "week_start":
         weekday_idx = categorize.parse_week_start_input(text)
@@ -2184,6 +2254,8 @@ async def _post_init(application: Application):
         BotCommand("invite", "کد دعوت خانواده"),
         BotCommand("members", "اعضای خانواده"),
         BotCommand("join", "پیوستن به خانواده‌ای دیگر"),
+        BotCommand("connectemail", "اتصال ایمیل برای خوندن خودکار فاکتور"),
+        BotCommand("disconnectemail", "قطع اتصال ایمیل"),
         BotCommand("backup", "دریافت نسخه پشتیبان دیتابیس"),
         BotCommand("restore", "بازگردانی دیتابیس از فایل بک‌آپ"),
         BotCommand("help", "راهنما"),
@@ -2210,6 +2282,54 @@ async def _send_period_end_reports(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Failed to build period-end report for household {household_id}")
 
 
+async def _check_email_receipts(context: ContextTypes.DEFAULT_TYPE):
+    """هر ۲۰ دقیقه اجرا می‌شه (job زمان‌بندی‌شده). برای هر خانواده‌ای که ایمیل وصل کرده، ایمیل رو
+    چک می‌کنه، پیوست‌های PDF فاکتورهای جدید (فقط از فرستنده‌ی فیلترشده، مثلاً Mercadona) رو با همون
+    موتور OCR/PDF فاکتورهای دستی پردازش می‌کنه، و قبل از ثبت نهایی، پیش‌نویس رو برای تایید هر عضو
+    خانواده می‌فرسته — دقیقاً مثل وقتی که خودت عکس/PDF فاکتور رو دستی می‌فرستی."""
+    loop = asyncio.get_event_loop()
+    for acc in db.get_all_email_accounts():
+        household_id = acc["household_id"]
+        try:
+            results, new_last_uid = await loop.run_in_executor(
+                None, mailfetch.fetch_new_receipt_pdfs,
+                acc["email_address"], acc["app_password"], acc["imap_host"], acc["imap_port"],
+                acc["sender_filter"], acc["last_uid"],
+            )
+        except Exception:
+            logger.exception(f"Email check failed for household {household_id}")
+            continue
+
+        if new_last_uid != acc["last_uid"]:
+            db.update_email_last_uid(household_id, new_last_uid)
+
+        if not results:
+            continue
+
+        cur = db.get_currency(household_id)
+        members = db.get_household_members(household_id)
+        for item in results:
+            for pdf_bytes in item["pdfs"]:
+                try:
+                    receipt_lines, _note = await _handle_pdf_receipt(None, household_id, pdf_bytes)
+                except Exception:
+                    logger.exception(f"Failed to parse emailed PDF receipt for household {household_id}")
+                    continue
+                if not receipt_lines:
+                    continue
+                note = f"📧 از ایمیل — {item['subject']}"
+                text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, store="Mercadona")
+                for m in members:
+                    chat_id = m["telegram_id"]
+                    try:
+                        context.application.chat_data[chat_id]["receipt_draft"] = {
+                            "lines": receipt_lines, "note": note, "store": "Mercadona",
+                        }
+                        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+                    except Exception:
+                        logger.exception(f"Failed to send email receipt draft to {chat_id}")
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده. در README توضیح داده شده.")
@@ -2224,6 +2344,8 @@ def main():
     app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CommandHandler("members", members_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
+    app.add_handler(CommandHandler("connectemail", connectemail_cmd))
+    app.add_handler(CommandHandler("disconnectemail", disconnectemail_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("budget", budget_cmd))
@@ -2268,10 +2390,12 @@ def main():
         # هر روز ساعت ۲۱:۰۰ (به وقت سرور) چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
         # بازه بودجه‌شونه واقعاً پیام می‌فرسته
         app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0))
+        # هر ۲۰ دقیقه چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
+        app.job_queue.run_repeating(_check_email_receipts, interval=1200, first=60)
     else:
         logger.warning(
             "JobQueue در دسترس نیست (پکیج python-telegram-bot[job-queue] نصب نشده)؛ "
-            "گزارش خودکار پایان بازه غیرفعاله."
+            "گزارش خودکار پایان بازه و چک ایمیل غیرفعاله."
         )
 
     logger.info("Bot starting (polling)...")

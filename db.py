@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS category_budgets (
     FOREIGN KEY (household_id) REFERENCES households(id)
 );
 
+CREATE TABLE IF NOT EXISTS email_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL UNIQUE,
+    email_address TEXT NOT NULL,
+    app_password TEXT NOT NULL,       -- App Password (نه رمز اصلی حساب)
+    imap_host TEXT NOT NULL DEFAULT 'imap.gmail.com',
+    imap_port INTEGER NOT NULL DEFAULT 993,
+    sender_filter TEXT DEFAULT 'mercadona',  -- فقط ایمیل‌هایی که فرستنده‌شون شامل این رشته باشه چک می‌شه
+    last_uid INTEGER DEFAULT 0,       -- آخرین UID پردازش‌شده، برای جلوگیری از پردازش تکراری
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(id)
+);
+
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     household_id INTEGER NOT NULL,
@@ -456,6 +469,44 @@ def get_category_budgets_with_spent(household_id):
                 "remaining": b["amount"] - spent,
             })
         return result
+
+
+# ---------- اتصال ایمیل برای خوندن خودکار فاکتور ----------
+
+def set_email_account(household_id, email_address, app_password, imap_host="imap.gmail.com",
+                       imap_port=993, sender_filter="mercadona"):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM email_accounts WHERE household_id=?", (household_id,))
+        conn.execute(
+            """INSERT INTO email_accounts
+               (household_id, email_address, app_password, imap_host, imap_port, sender_filter, last_uid, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+            (household_id, email_address, app_password, imap_host, imap_port, sender_filter,
+             datetime.utcnow().isoformat()),
+        )
+
+
+def get_email_account(household_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM email_accounts WHERE household_id=?", (household_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_email_accounts():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM email_accounts").fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_email_last_uid(household_id, uid):
+    with get_conn() as conn:
+        conn.execute("UPDATE email_accounts SET last_uid=? WHERE household_id=?", (uid, household_id))
+
+
+def delete_email_account(household_id):
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM email_accounts WHERE household_id=?", (household_id,))
+        return cur.rowcount
 
 
 # ---------- قبض‌های تکرارشونده ----------
