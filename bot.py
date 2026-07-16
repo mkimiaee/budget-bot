@@ -1691,14 +1691,32 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"📧 ایمیل وصل‌شده: {masked}\n"
                 f"فیلتر فرستنده: {acc['sender_filter']}\n"
-                "هر ۲۰ دقیقه چک می‌شه و فاکتور جدید رو قبل از ثبت برای تایید می‌فرسته.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔌 قطع اتصال", callback_data="m:disconnectemail")]]),
+                "روزی دو بار (۱۳:۰۰ و ۲۲:۰۰) خودکار چک می‌شه و فاکتور جدید رو قبل از ثبت برای تایید می‌فرسته.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 چک کن الان", callback_data="m:checkemailnow")],
+                    [InlineKeyboardButton("🔌 قطع اتصال", callback_data="m:disconnectemail")],
+                ]),
             )
         else:
             context.chat_data["awaiting"] = "connectemail_address"
             await query.edit_message_text(
                 "📧 آدرس ایمیل جیمیلت رو بفرست (همونی که فاکتورهای Mercadona توش میاد):"
             )
+
+    elif action == "checkemailnow":
+        acc = db.get_email_account(household_id)
+        if not acc:
+            await query.edit_message_text("هنوز ایمیلی وصل نکردی.")
+            return
+        await query.edit_message_text("🔄 در حال چک کردن ایمیل...")
+        sent_count = await _check_email_for_account(context, acc)
+        if sent_count:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ {sent_count} فاکتور جدید پیدا شد و برای تایید فرستادم (پیام‌های بالاتر رو ببین).",
+            )
+        else:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="چیز جدیدی پیدا نشد.")
 
     elif action == "disconnectemail":
         db.delete_email_account(household_id)
@@ -1885,8 +1903,9 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         app_password = text.strip().replace(" ", "")
         db.set_email_account(household_id, draft["email"], app_password)
         await update.message.reply_text(
-            "✅ ایمیل وصل شد. هر ۲۰ دقیقه چک می‌کنم ببینم فاکتور جدیدی از Mercadona اومده یا نه، "
+            "✅ ایمیل وصل شد. روزی دو بار (۱۳:۰۰ و ۲۲:۰۰) چک می‌کنم ببینم فاکتور جدیدی از Mercadona اومده یا نه، "
             "و قبل از ثبت، برای تاییدت می‌فرستم (دقیقاً مثل فاکتوری که خودت عکسش رو می‌فرستی).\n"
+            "اگه نمی‌خوای صبر کنی، از منوی ⚙️ تنظیمات دکمه «🔄 چک کن الان» رو بزن.\n"
             "برای قطع اتصال: /disconnectemail"
         )
         return
@@ -2282,52 +2301,60 @@ async def _send_period_end_reports(context: ContextTypes.DEFAULT_TYPE):
             logger.exception(f"Failed to build period-end report for household {household_id}")
 
 
-async def _check_email_receipts(context: ContextTypes.DEFAULT_TYPE):
-    """هر ۲۰ دقیقه اجرا می‌شه (job زمان‌بندی‌شده). برای هر خانواده‌ای که ایمیل وصل کرده، ایمیل رو
-    چک می‌کنه، پیوست‌های PDF فاکتورهای جدید (فقط از فرستنده‌ی فیلترشده، مثلاً Mercadona) رو با همون
-    موتور OCR/PDF فاکتورهای دستی پردازش می‌کنه، و قبل از ثبت نهایی، پیش‌نویس رو برای تایید هر عضو
-    خانواده می‌فرسته — دقیقاً مثل وقتی که خودت عکس/PDF فاکتور رو دستی می‌فرستی."""
+async def _check_email_for_account(context: ContextTypes.DEFAULT_TYPE, acc) -> int:
+    """ایمیل یک خانواده رو چک می‌کنه، پیوست‌های PDF فاکتورهای جدید (فقط از فرستنده‌ی فیلترشده،
+    مثلاً Mercadona) رو با همون موتور OCR/PDF فاکتورهای دستی پردازش می‌کنه، و قبل از ثبت نهایی،
+    پیش‌نویس رو برای تایید هر عضو خانواده می‌فرسته — دقیقاً مثل وقتی که خودت عکس/PDF فاکتور رو
+    دستی می‌فرستی. تعداد پیش‌نویس‌های فرستاده‌شده رو برمی‌گردونه."""
+    household_id = acc["household_id"]
     loop = asyncio.get_event_loop()
-    for acc in db.get_all_email_accounts():
-        household_id = acc["household_id"]
-        try:
-            results, new_last_uid = await loop.run_in_executor(
-                None, mailfetch.fetch_new_receipt_pdfs,
-                acc["email_address"], acc["app_password"], acc["imap_host"], acc["imap_port"],
-                acc["sender_filter"], acc["last_uid"],
-            )
-        except Exception:
-            logger.exception(f"Email check failed for household {household_id}")
-            continue
+    try:
+        results, new_last_uid = await loop.run_in_executor(
+            None, mailfetch.fetch_new_receipt_pdfs,
+            acc["email_address"], acc["app_password"], acc["imap_host"], acc["imap_port"],
+            acc["sender_filter"], acc["last_uid"],
+        )
+    except Exception:
+        logger.exception(f"Email check failed for household {household_id}")
+        return 0
 
-        if new_last_uid != acc["last_uid"]:
-            db.update_email_last_uid(household_id, new_last_uid)
+    if new_last_uid != acc["last_uid"]:
+        db.update_email_last_uid(household_id, new_last_uid)
 
-        if not results:
-            continue
+    if not results:
+        return 0
 
-        cur = db.get_currency(household_id)
-        members = db.get_household_members(household_id)
-        for item in results:
-            for pdf_bytes in item["pdfs"]:
+    cur = db.get_currency(household_id)
+    members = db.get_household_members(household_id)
+    sent_count = 0
+    for item in results:
+        for pdf_bytes in item["pdfs"]:
+            try:
+                receipt_lines, _note = await _handle_pdf_receipt(None, household_id, pdf_bytes)
+            except Exception:
+                logger.exception(f"Failed to parse emailed PDF receipt for household {household_id}")
+                continue
+            if not receipt_lines:
+                continue
+            note = f"📧 از ایمیل — {item['subject']}"
+            text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, store="Mercadona")
+            for m in members:
+                chat_id = m["telegram_id"]
                 try:
-                    receipt_lines, _note = await _handle_pdf_receipt(None, household_id, pdf_bytes)
+                    context.application.chat_data[chat_id]["receipt_draft"] = {
+                        "lines": receipt_lines, "note": note, "store": "Mercadona",
+                    }
+                    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
                 except Exception:
-                    logger.exception(f"Failed to parse emailed PDF receipt for household {household_id}")
-                    continue
-                if not receipt_lines:
-                    continue
-                note = f"📧 از ایمیل — {item['subject']}"
-                text, kb = _receipt_preview_text_and_keyboard(cur, receipt_lines, note, store="Mercadona")
-                for m in members:
-                    chat_id = m["telegram_id"]
-                    try:
-                        context.application.chat_data[chat_id]["receipt_draft"] = {
-                            "lines": receipt_lines, "note": note, "store": "Mercadona",
-                        }
-                        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-                    except Exception:
-                        logger.exception(f"Failed to send email receipt draft to {chat_id}")
+                    logger.exception(f"Failed to send email receipt draft to {chat_id}")
+            sent_count += 1
+    return sent_count
+
+
+async def _check_email_receipts(context: ContextTypes.DEFAULT_TYPE):
+    """job زمان‌بندی‌شده (هر روز ساعت ۱۳ و ۲۲): ایمیل همه خانواده‌های وصل‌شده رو چک می‌کنه."""
+    for acc in db.get_all_email_accounts():
+        await _check_email_for_account(context, acc)
 
 
 def main():
@@ -2390,8 +2417,9 @@ def main():
         # هر روز ساعت ۲۱:۰۰ (به وقت سرور) چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
         # بازه بودجه‌شونه واقعاً پیام می‌فرسته
         app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0))
-        # هر ۲۰ دقیقه چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
-        app.job_queue.run_repeating(_check_email_receipts, interval=1200, first=60)
+        # روزی دو بار (۱۳:۰۰ و ۲۲:۰۰ به وقت سرور) چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=13, minute=0))
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=22, minute=0))
     else:
         logger.warning(
             "JobQueue در دسترس نیست (پکیج python-telegram-bot[job-queue] نصب نشده)؛ "
