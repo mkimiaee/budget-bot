@@ -125,9 +125,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     existing = db.get_user_household(user.id)
     if existing:
-        code = db.get_invite_code(existing)
+        if db.is_household_owner(existing, user.id):
+            code = db.get_invite_code(existing)
+            extra = f" کد دعوت خانواده‌ت: {code}\n"
+        else:
+            extra = "\n"
         await update.message.reply_text(
-            f"سلام {user.first_name}! قبلاً ثبت‌نامی. کد دعوت خانواده‌ت: {code}\n"
+            f"سلام {user.first_name}! قبلاً ثبت‌نامی.{extra}"
             "از منوی پایین صفحه استفاده کن یا /help رو بزن.",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
@@ -170,7 +174,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list — نمایش وضعیت لیست خرید فعلی\n"
         "/categories — نمایش دسته‌بندی‌ها\n"
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
-        "/invite — گرفتن کد دعوت خانواده\n"
+        "/invite — گرفتن کد دعوت خانواده (فقط ادمین/سازنده خانواده)\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
         "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n"
         "/restore — بازگردانی دیتابیس از یه فایل بک‌آپ قدیمی (کل دیتابیس فعلی رو جایگزین می‌کنه)\n\n"
@@ -183,6 +187,11 @@ async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     household_id = db.get_user_household(update.effective_user.id)
     if not household_id:
         await update.message.reply_text("اول /start رو بزن.")
+        return
+    if not db.is_household_owner(household_id, update.effective_user.id):
+        owner_name = db.get_owner_display_name(household_id)
+        who = f"از {owner_name}" if owner_name else "از ادمین خانواده"
+        await update.message.reply_text(f"کد دعوت رو فقط ادمین خانواده می‌تونه ببینه. {who} بخواه برات بفرسته.")
         return
     code = db.get_invite_code(household_id)
     await update.message.reply_text(f"کد دعوت خانواده: `{code}`", parse_mode=ParseMode.MARKDOWN)
@@ -1143,8 +1152,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(_categories_text(household_id))
 
     elif action == "invite":
-        code = db.get_invite_code(household_id)
-        await query.edit_message_text(f"کد دعوت خانواده: {code}")
+        if not db.is_household_owner(household_id, update.effective_user.id):
+            owner_name = db.get_owner_display_name(household_id)
+            who = f"از {owner_name}" if owner_name else "از ادمین خانواده"
+            await query.edit_message_text(f"کد دعوت رو فقط ادمین خانواده می‌تونه ببینه. {who} بخواه برات بفرسته.")
+        else:
+            code = db.get_invite_code(household_id)
+            await query.edit_message_text(f"کد دعوت خانواده: {code}")
 
     elif action == "recalc":
         await query.edit_message_text(_recalc_text(household_id), reply_markup=_settings_keyboard())

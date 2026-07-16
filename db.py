@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS households (
     currency TEXT DEFAULT 'تومان',
     budget_period TEXT DEFAULT 'monthly',      -- 'monthly' | 'weekly'
     week_start_weekday INTEGER,                -- 0=دوشنبه .. 6=یکشنبه (فقط وقتی weekly است)
+    owner_id INTEGER,                          -- telegram_id کسی که خانواده رو ساخته؛ فقط همون کد دعوت رو می‌بینه
     created_at TEXT NOT NULL
 );
 
@@ -153,6 +154,22 @@ def init_db():
             conn.execute("ALTER TABLE households ADD COLUMN budget_period TEXT DEFAULT 'monthly'")
         if "week_start_weekday" not in cols:
             conn.execute("ALTER TABLE households ADD COLUMN week_start_weekday INTEGER")
+        if "owner_id" not in cols:
+            conn.execute("ALTER TABLE households ADD COLUMN owner_id INTEGER")
+            # برای خانواده‌های قدیمی‌تر که owner_id ندارن، قدیمی‌ترین عضو رو مالک در نظر می‌گیریم
+            households_without_owner = conn.execute(
+                "SELECT id FROM households WHERE owner_id IS NULL"
+            ).fetchall()
+            for h in households_without_owner:
+                first_member = conn.execute(
+                    "SELECT telegram_id FROM users WHERE household_id=? ORDER BY joined_at LIMIT 1",
+                    (h["id"],),
+                ).fetchone()
+                if first_member:
+                    conn.execute(
+                        "UPDATE households SET owner_id=? WHERE id=?",
+                        (first_member["telegram_id"], h["id"]),
+                    )
         tx_cols = [r["name"] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()]
         if "store" not in tx_cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN store TEXT")
@@ -190,8 +207,8 @@ def create_household_and_user(telegram_id, display_name, household_name=None):
             code = _new_invite_code()
         name = household_name or f"خانواده {display_name or telegram_id}"
         cur = conn.execute(
-            "INSERT INTO households (name, invite_code, currency, created_at) VALUES (?, ?, ?, ?)",
-            (name, code, DEFAULT_CURRENCY, datetime.utcnow().isoformat()),
+            "INSERT INTO households (name, invite_code, currency, owner_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (name, code, DEFAULT_CURRENCY, telegram_id, datetime.utcnow().isoformat()),
         )
         household_id = cur.lastrowid
         conn.execute(
@@ -218,6 +235,27 @@ def get_invite_code(household_id):
     with get_conn() as conn:
         row = conn.execute("SELECT invite_code FROM households WHERE id=?", (household_id,)).fetchone()
         return row["invite_code"] if row else None
+
+
+def get_owner_id(household_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT owner_id FROM households WHERE id=?", (household_id,)).fetchone()
+        return row["owner_id"] if row else None
+
+
+def is_household_owner(household_id, telegram_id):
+    return get_owner_id(household_id) == telegram_id
+
+
+def get_owner_display_name(household_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT u.display_name FROM users u
+               JOIN households h ON h.owner_id = u.telegram_id
+               WHERE h.id=?""",
+            (household_id,),
+        ).fetchone()
+        return row["display_name"] if row and row["display_name"] else None
 
 
 def get_currency(household_id):
