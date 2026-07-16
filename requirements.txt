@@ -1,6 +1,7 @@
-python-telegram-bot==21.4
+python-telegram-bot[job-queue]==21.4
 Pillow==10.4.0
 pytesseract==0.3.13
 rapidfuzz==3.9.7
 python-dotenv==1.0.1
 PyMuPDF==1.28.0
+matplotlib==3.9.2

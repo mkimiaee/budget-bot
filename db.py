@@ -68,6 +68,27 @@ CREATE TABLE IF NOT EXISTS categories (
     keywords TEXT DEFAULT ''       -- کلمات کلیدی جدا شده با کاما برای دسته‌بندی خودکار
 );
 
+CREATE TABLE IF NOT EXISTS recurring_bills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    amount REAL NOT NULL,
+    category TEXT,                 -- اگه خالی باشه، موقع ثبت "قبض" استفاده می‌شه
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(id)
+);
+
+CREATE TABLE IF NOT EXISTS category_budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    period_type TEXT NOT NULL,     -- 'monthly' | 'weekly'
+    amount REAL NOT NULL,
+    period_key TEXT NOT NULL,      -- e.g. '2026-07'
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(id)
+);
+
 CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     household_id INTEGER NOT NULL,
@@ -247,6 +268,31 @@ def get_owner_id(household_id):
         return row["owner_id"] if row else None
 
 
+def get_household_members(household_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT telegram_id, display_name, joined_at FROM users WHERE household_id=? ORDER BY joined_at",
+            (household_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_household_ids():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id FROM households").fetchall()
+        return [r["id"] for r in rows]
+
+
+def remove_member(household_id, telegram_id):
+    """عضو رو از خانواده حذف می‌کنه؛ خودش می‌تونه بعداً /start بزنه (خانواده جدید بسازه) یا دوباره join کنه."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM users WHERE household_id=? AND telegram_id=?",
+            (household_id, telegram_id),
+        )
+        return cur.rowcount
+
+
 def is_household_owner(household_id, telegram_id):
     return get_owner_id(household_id) == telegram_id
 
@@ -359,6 +405,105 @@ def get_budget(household_id):
         return row["amount"] if row else None
 
 
+def set_category_budget(household_id, category, amount):
+    """بودجه بازه جاری رو برای یک دسته مشخص تنظیم می‌کنه. amount<=0 یعنی حذف بودجه اون دسته."""
+    start, end, period_key, period_type = get_current_period_bounds(household_id)
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM category_budgets WHERE household_id=? AND category=? AND period_type=? AND period_key=?",
+            (household_id, category, period_type, period_key),
+        )
+        if amount and amount > 0:
+            conn.execute(
+                """INSERT INTO category_budgets (household_id, category, period_type, amount, period_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (household_id, category, period_type, amount, period_key, datetime.utcnow().isoformat()),
+            )
+
+
+def get_category_budget(household_id, category):
+    start, end, period_key, period_type = get_current_period_bounds(household_id)
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT amount FROM category_budgets
+               WHERE household_id=? AND category=? AND period_type=? AND period_key=?
+               ORDER BY id DESC LIMIT 1""",
+            (household_id, category, period_type, period_key),
+        ).fetchone()
+        return row["amount"] if row else None
+
+
+def get_category_budgets_with_spent(household_id):
+    """همه‌ی بودجه‌های دسته‌ایِ تنظیم‌شده برای بازه جاری، به‌همراه مبلغ خرج‌شده‌ی همون دسته تا الان
+    (فقط هزینه‌های داخل بودجه، هزینه‌های جانبی حساب نمی‌شن — مشابه بودجه کلی)."""
+    start, end, period_key, period_type = get_current_period_bounds(household_id)
+    with get_conn() as conn:
+        budgets = conn.execute(
+            "SELECT category, amount FROM category_budgets WHERE household_id=? AND period_type=? AND period_key=? ORDER BY id",
+            (household_id, period_type, period_key),
+        ).fetchall()
+        result = []
+        for b in budgets:
+            spent_row = conn.execute(
+                """SELECT COALESCE(SUM(amount),0) s FROM transactions
+                   WHERE household_id=? AND type='expense' AND category=? AND in_budget=1
+                     AND tx_date BETWEEN ? AND ?""",
+                (household_id, b["category"], start.isoformat(), end.isoformat()),
+            ).fetchone()
+            spent = spent_row["s"]
+            result.append({
+                "category": b["category"], "budget": b["amount"], "spent": spent,
+                "remaining": b["amount"] - spent,
+            })
+        return result
+
+
+# ---------- قبض‌های تکرارشونده ----------
+
+def add_or_update_recurring_bill(household_id, name, amount, category=None):
+    """اگه قبضی با همین اسم قبلاً تعریف شده، مبلغش رو آپدیت می‌کنه؛ وگرنه یکی جدید می‌سازه."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM recurring_bills WHERE household_id=? AND name=?",
+            (household_id, name),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE recurring_bills SET amount=?, category=? WHERE id=?",
+                (amount, category, existing["id"]),
+            )
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO recurring_bills (household_id, name, amount, category, created_at) VALUES (?, ?, ?, ?, ?)",
+            (household_id, name, amount, category, datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def get_recurring_bills(household_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM recurring_bills WHERE household_id=? ORDER BY id",
+            (household_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recurring_bill(bill_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM recurring_bills WHERE id=?", (bill_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_recurring_bill(household_id, bill_id):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM recurring_bills WHERE id=? AND household_id=?",
+            (bill_id, household_id),
+        )
+        return cur.rowcount
+
+
 def add_transaction(household_id, user_id, tx_type, amount, category=None, description=None,
                      source="manual", tx_date=None, store=None, receipt_id=None, in_budget=1):
     tx_date = tx_date or date.today().isoformat()
@@ -387,6 +532,15 @@ def get_recent_transactions(household_id, limit=10):
             (household_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_last_transaction(household_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM transactions WHERE household_id=? ORDER BY id DESC LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def delete_transaction(tx_id):
@@ -478,31 +632,47 @@ def get_balance(household_id):
     }
 
 
+def _report_period_bounds(household_id, period):
+    """بازه تاریخ (start, end به‌صورت رشته YYYY-MM-DD) برای یک برچسب گزارش ('day'|'week'|'month'|'period')
+    را برمی‌گرداند. برای 'week' از همان روز شروع هفته‌ای استفاده می‌شود که در تنظیمات بازه بودجه انتخاب
+    شده (week_start_weekday)، تا جمع گزارش هفتگی همیشه با محاسبه /balance یکی باشد."""
+    today = date.today()
+    if period in ("day", "روز"):
+        return today.isoformat(), today.isoformat()
+    if period in ("week", "هفته"):
+        p = get_budget_period(household_id)
+        wd = p["week_start_weekday"] if p["week_start_weekday"] is not None else 0
+        days_since_start = (today.weekday() - wd) % 7
+        start = (today - timedelta(days=days_since_start)).isoformat()
+        return start, today.isoformat()
+    if period in ("period", "بازه"):
+        p_start, p_end, _, _ = get_current_period_bounds(household_id, today)
+        return p_start.isoformat(), today.isoformat()
+    # month
+    return today.replace(day=1).isoformat(), today.isoformat()
+
+
+def get_category_totals(household_id, period):
+    """جمع هزینه‌های داخل بودجه (in_budget=1) به تفکیک دسته، برای یک بازه گزارش — برای نمودار."""
+    start, end = _report_period_bounds(household_id, period)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT COALESCE(category, 'متفرقه') as category, SUM(amount) as total FROM transactions
+               WHERE household_id=? AND type='expense' AND in_budget=1 AND tx_date BETWEEN ? AND ?
+               GROUP BY category ORDER BY total DESC""",
+            (household_id, start, end),
+        ).fetchall()
+        return [{"category": r["category"], "total": r["total"]} for r in rows]
+
+
 def get_report(household_id, period):
     """
     گزارش ساده: هر فاکتور (همه ردیف‌های یک عکس/PDF که receipt_id مشترک دارند) یک ردیف واحد
     می‌شود (با جمع مبلغش)، و هر هزینه دستی هم یک ردیف جدا؛ فقط تاریخ، یک برچسب کوتاه، و مبلغ —
     بدون جزئیات ردیف‌به‌ردیف فاکتور. به‌علاوه جمع کل بازه و جمع امروز.
-    برای 'week' از همان روز شروع هفته‌ای استفاده می‌شود که در تنظیمات بازه بودجه انتخاب شده
-    (week_start_weekday)، تا جمع گزارش هفتگی همیشه با محاسبه /balance یکی باشد. اگر خانواده
-    هنوز روز شروع هفته را تنظیم نکرده، پیش‌فرض دوشنبه است.
     """
+    start, end = _report_period_bounds(household_id, period)
     today = date.today()
-    if period in ("day", "روز"):
-        start, end = today.isoformat(), today.isoformat()
-    elif period in ("week", "هفته"):
-        p = get_budget_period(household_id)
-        wd = p["week_start_weekday"] if p["week_start_weekday"] is not None else 0
-        days_since_start = (today.weekday() - wd) % 7
-        start = (today - timedelta(days=days_since_start)).isoformat()
-        end = today.isoformat()
-    elif period in ("period", "بازه"):
-        # دقیقاً همان بازه بودجه‌ای که خانواده تنظیم کرده (هفتگی یا ماهانه)
-        p_start, p_end, _, _ = get_current_period_bounds(household_id, today)
-        start, end = p_start.isoformat(), today.isoformat()
-    else:  # month
-        start = today.replace(day=1).isoformat()
-        end = today.isoformat()
 
     with get_conn() as conn:
         rows = conn.execute(
@@ -569,6 +739,26 @@ def add_category(household_id, name, keywords=""):
             "INSERT INTO categories (household_id, name, keywords) VALUES (?, ?, ?)",
             (household_id, name, keywords),
         )
+
+
+def get_household_only_categories(household_id):
+    """فقط دسته‌های اختصاصی همین خانواده (بدون دسته‌های سراسری پیش‌فرض) — این‌ها قابل حذفن."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, keywords FROM categories WHERE household_id=? ORDER BY id",
+            (household_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_category(household_id, category_id):
+    """فقط دسته‌های اختصاصی همون خانواده حذف می‌شن؛ دسته‌های سراسری پیش‌فرض (household_id IS NULL) دست‌نخورده می‌مونن."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM categories WHERE id=? AND household_id=?",
+            (category_id, household_id),
+        )
+        return cur.rowcount
 
 
 # ---------- لیست خرید ----------

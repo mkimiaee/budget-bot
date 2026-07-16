@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 import uuid
-from datetime import date, timedelta
+from datetime import date, time as dt_time, timedelta
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +35,14 @@ from telegram.ext import (
 import db
 import categorize
 import ocr
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # بدون نیاز به نمایشگر، فقط برای تولید فایل عکس
+    import matplotlib.pyplot as plt
+    CHART_AVAILABLE = True
+except ImportError:
+    CHART_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("budget-bot")
@@ -111,6 +119,31 @@ def _period_label(household_id):
     return "این ماه"
 
 
+BUDGET_ALERT_THRESHOLDS = (0.8, 0.9)  # درصدهایی که ازشون رد شدن باعث هشدار می‌شه
+
+
+def _budget_alert_text(household_id, cur):
+    """اگه مصرف بودجه بازه جاری از آستانه‌های هشدار رد شده باشه (یا کلاً بودجه تموم شده)، یه پیام هشدار
+    برمی‌گردونه؛ وگرنه None. فقط هزینه‌های داخل بودجه (in_budget=1) رو حساب می‌کنه، هزینه‌های جانبی روش
+    اثر نمی‌ذارن."""
+    bal = db.get_balance(household_id)
+    if not bal["budget"]:
+        return None
+    effective_total = bal["budget"] + bal["period_income"]
+    if effective_total <= 0:
+        return None
+    if bal["remaining"] < 0:
+        label = _period_label(household_id)
+        return f"🔴 هشدار: از بودجه {label} رد شدی! ({fmt(-bal['remaining'], cur)} بیشتر از بودجه خرج شده)"
+    used_fraction = bal["period_expense"] / effective_total
+    label = _period_label(household_id)
+    for threshold in sorted(BUDGET_ALERT_THRESHOLDS, reverse=True):
+        if used_fraction >= threshold:
+            icon = "🟠" if threshold >= 0.9 else "🟡"
+            return f"{icon} توجه: {round(used_fraction * 100)}٪ از بودجه {label} مصرف شده."
+    return None
+
+
 def _report_period_keyboard():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("امروز", callback_data="m:report:day"),
@@ -162,19 +195,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/menu — باز کردن منوی اصلی (دکمه‌ای)\n"
         "/budget <مبلغ> — تنظیم بودجه بازه جاری (هفتگی یا ماهانه)\n"
         "/budget +<مبلغ> یا /budget -<مبلغ> — افزایش/کاهش بودجه فعلی\n"
+        "/catbudget <دسته> | <مبلغ> — بودجه جداگانه برای یک دسته (مثلاً /catbudget خوار و بار | 3000000)\n"
+        "/catbudget — نمایش بودجه‌های دسته‌ای تنظیم‌شده\n"
+        "/addbill <نام قبض> | <مبلغ پیش‌فرض> — تعریف/آپدیت یه قبض تکرارشونده\n"
+        "/bills — نمایش قبض‌های تکرارشونده برای ثبت سریع با یه تپ\n"
         "/period monthly یا /period weekly <روز> — انتخاب بازه بودجه\n"
         "/income <مبلغ> [توضیح] — ثبت درآمد\n"
         "/expense <مبلغ> [توضیح] — ثبت هزینه (یا فقط بنویس: نان 50000 فروشگاه رفاه تاریخ 2026-07-10)\n"
         "/balance — باقیمانده بودجه\n"
         "/recalc — محاسبه مجدد بودجه و هزینه‌ها از صفر (برای اطمینان از درستی عددها)\n"
         "/report day|week|month — لیست هزینه‌ها (تاریخ و مبلغ) و جمع بازه\n"
+        "/chart day|week|month — نمودار دایره‌ای هزینه‌ها بر اساس دسته\n"
         "/transactions — نمایش تراکنش‌های اخیر برای حذف یا ویرایش\n"
+        "/undo — برگردوندن آخرین تراکنش ثبت‌شده (هزینه یا درآمد)\n"
         "/newlist — شروع لیست خرید جدید (بعدش هر آیتم رو یک خط بفرست)\n"
         "/donelist — پایان وارد کردن آیتم‌های لیست\n"
         "/list — نمایش وضعیت لیست خرید فعلی\n"
         "/categories — نمایش دسته‌بندی‌ها\n"
+        "/addcategory <نام> | <کلمات کلیدی> — دسته جدید اضافه کن\n"
+        "/delcategory — حذف یکی از دسته‌های اختصاصی خانواده\n"
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
         "/invite — گرفتن کد دعوت خانواده (فقط ادمین/سازنده خانواده)\n"
+        "/members — نمایش اعضای خانواده (ادمین می‌تونه عضو حذف کنه)\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
         "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n"
         "/restore — بازگردانی دیتابیس از یه فایل بک‌آپ قدیمی (کل دیتابیس فعلی رو جایگزین می‌کنه)\n\n"
@@ -195,6 +237,54 @@ async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     code = db.get_invite_code(household_id)
     await update.message.reply_text(f"کد دعوت خانواده: `{code}`", parse_mode=ParseMode.MARKDOWN)
+
+
+@require_household
+async def members_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    members = db.get_household_members(household_id)
+    owner_id = db.get_owner_id(household_id)
+    is_owner = db.is_household_owner(household_id, update.effective_user.id)
+
+    lines = ["👨‍👩‍👧‍👦 اعضای خانواده:\n"]
+    buttons = []
+    for m in members:
+        label = m["display_name"] or str(m["telegram_id"])
+        tag = " 👑 (ادمین)" if m["telegram_id"] == owner_id else ""
+        lines.append(f"• {label}{tag}")
+        if is_owner and m["telegram_id"] != owner_id:
+            buttons.append([InlineKeyboardButton(f"🗑 حذف {label}", callback_data=f"member:remove:{m['telegram_id']}")])
+
+    if not is_owner:
+        lines.append("\nفقط ادمین خانواده می‌تونه عضو حذف کنه.")
+
+    kb = InlineKeyboardMarkup(buttons) if buttons else None
+    await update.message.reply_text("\n".join(lines), reply_markup=kb)
+
+
+async def member_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    household_id = db.get_user_household(update.effective_user.id)
+    if household_id is None:
+        await query.edit_message_text("اول /start رو بزن.")
+        return
+    if not db.is_household_owner(household_id, update.effective_user.id):
+        await query.edit_message_text("فقط ادمین خانواده می‌تونه عضو حذف کنه.")
+        return
+
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "remove" and len(parts) > 2:
+        target_id = int(parts[2])
+        owner_id = db.get_owner_id(household_id)
+        if target_id == owner_id:
+            await query.edit_message_text("نمی‌تونی ادمین (خودت) رو حذف کنی.")
+            return
+        removed = db.remove_member(household_id, target_id)
+        if removed:
+            await query.edit_message_text("✅ عضو از خانواده حذف شد.")
+        else:
+            await query.edit_message_text("این عضو پیدا نشد (شاید قبلاً حذف شده).")
 
 
 @require_household
@@ -426,6 +516,129 @@ async def budget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
 
 
 @require_household
+async def catbudget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    cur = db.get_currency(household_id)
+    raw = " ".join(context.args)
+
+    if not raw.strip():
+        rows = db.get_category_budgets_with_spent(household_id)
+        if not rows:
+            await update.message.reply_text(
+                "هنوز بودجه‌ای برای هیچ دسته‌ای تنظیم نشده.\n"
+                "فرمت تنظیم: /catbudget <نام دسته> | <مبلغ>\nمثال: /catbudget خوار و بار | 3000000"
+            )
+            return
+        lines = [f"📁 بودجه دسته‌ها ({_period_label(household_id)}):\n"]
+        for r in rows:
+            icon = " 🔴" if r["remaining"] < 0 else ""
+            lines.append(f"• {r['category']}: {fmt(r['spent'], cur)} / {fmt(r['budget'], cur)} (باقی: {fmt(r['remaining'], cur)}){icon}")
+        lines.append("\nبرای تغییر: /catbudget <نام دسته> | <مبلغ جدید>\nبرای حذف: /catbudget <نام دسته> | 0")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if "|" not in raw:
+        await update.message.reply_text(
+            "فرمت درست: /catbudget <نام دسته> | <مبلغ>\nمثال: /catbudget خوار و بار | 3000000"
+        )
+        return
+    cat_name, amount_str = raw.split("|", 1)
+    cat_name = cat_name.strip()
+    amount, _ = categorize.extract_amount(amount_str.strip())
+    if not cat_name or amount is None:
+        await update.message.reply_text(
+            "فرمت درست: /catbudget <نام دسته> | <مبلغ>\nمثال: /catbudget خوار و بار | 3000000"
+        )
+        return
+    db.set_category_budget(household_id, cat_name, amount)
+    if amount <= 0:
+        await update.message.reply_text(f"✅ بودجه دسته «{cat_name}» حذف شد.")
+    else:
+        await update.message.reply_text(
+            f"✅ بودجه دسته «{cat_name}» برای {_period_label(household_id)} روی {fmt(amount, cur)} تنظیم شد."
+        )
+
+
+@require_household
+async def addbill_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    raw = " ".join(context.args)
+    if "|" not in raw:
+        await update.message.reply_text(
+            "فرمت: /addbill <نام قبض> | <مبلغ پیش‌فرض>\nمثال: /addbill قبض برق | 350000\n"
+            "بعدش با /bills می‌تونی با یه تپ ثبتش کنی (به‌عنوان هزینه جانبی)."
+        )
+        return
+    name, amount_str = raw.split("|", 1)
+    name = name.strip()
+    amount, _ = categorize.extract_amount(amount_str.strip())
+    if not name or amount is None or amount <= 0:
+        await update.message.reply_text("فرمت: /addbill <نام قبض> | <مبلغ پیش‌فرض>\nمثال: /addbill قبض برق | 350000")
+        return
+    db.add_or_update_recurring_bill(household_id, name, amount)
+    cur = db.get_currency(household_id)
+    await update.message.reply_text(f"✅ قبض تکرارشونده «{name}» با مبلغ پیش‌فرض {fmt(amount, cur)} ذخیره شد. با /bills ثبتش کن.")
+
+
+def _bills_keyboard(bills):
+    buttons = []
+    for b in bills:
+        buttons.append([
+            InlineKeyboardButton(f"🧾 {b['name']} — {b['amount']:,.0f}", callback_data=f"bill:log:{b['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"bill:del:{b['id']}"),
+        ])
+    return InlineKeyboardMarkup(buttons)
+
+
+@require_household
+async def bills_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    bills = db.get_recurring_bills(household_id)
+    if not bills:
+        await update.message.reply_text(
+            "هنوز قبض تکرارشونده‌ای تعریف نکردی.\n"
+            "فرمت: /addbill <نام قبض> | <مبلغ پیش‌فرض>\nمثال: /addbill قبض برق | 350000"
+        )
+        return
+    await update.message.reply_text(
+        "🧾 قبض‌های تکرارشونده — بزن تا با مبلغ پیش‌فرض، به‌عنوان هزینه جانبی امروز ثبت بشه:",
+        reply_markup=_bills_keyboard(bills),
+    )
+
+
+async def bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    household_id = db.get_user_household(update.effective_user.id)
+    if household_id is None:
+        await query.edit_message_text("اول /start رو بزن.")
+        return
+
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    bill_id = int(parts[2]) if len(parts) > 2 else None
+    if bill_id is None:
+        return
+
+    bill = db.get_recurring_bill(bill_id)
+    if not bill or bill["household_id"] != household_id:
+        await query.edit_message_text("این قبض پیدا نشد (شاید حذف شده).")
+        return
+
+    if action == "log":
+        cur = db.get_currency(household_id)
+        db.add_transaction(
+            household_id, update.effective_user.id, "expense", bill["amount"],
+            category=bill["category"] or "قبض", description=bill["name"],
+            source="manual", tx_date=date.today().isoformat(), in_budget=0,
+        )
+        await query.edit_message_text(
+            f"✅ «{bill['name']}» با مبلغ {fmt(bill['amount'], cur)} به‌عنوان هزینه جانبی امروز ثبت شد.\n"
+            "اگه این ماه مبلغش فرق داره، با /addbill دوباره مبلغ پیش‌فرض رو آپدیت کن."
+        )
+    elif action == "del":
+        db.delete_recurring_bill(household_id, bill_id)
+        await query.edit_message_text(f"🗑 قبض تکرارشونده «{bill['name']}» حذف شد.")
+
+
+@require_household
 async def income_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     text = " ".join(context.args)
     await _register_income(update, household_id, text)
@@ -547,6 +760,9 @@ async def _commit_expense_draft(update: Update, context: ContextTypes.DEFAULT_TY
     if in_budget:
         bal = db.get_balance(household_id)
         tail = f"\nباقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+        alert = _budget_alert_text(household_id, cur)
+        if alert:
+            tail += f"\n\n{alert}"
     else:
         tail = "\n📎 این هزینه جانبیه، جزو بودجه حساب نشد و فقط تو گزارش می‌بینیش."
     text = (
@@ -628,6 +844,9 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if in_budget:
             bal = db.get_balance(household_id)
             tail = f"\nباقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}"
+            alert = _budget_alert_text(household_id, cur)
+            if alert:
+                tail += f"\n\n{alert}"
         else:
             tail = "\n📎 این هزینه جانبیه، جزو بودجه حساب نشد و فقط تو گزارش می‌بینیش."
         await query.edit_message_text(
@@ -673,7 +892,7 @@ def _balance_text(household_id):
         return "هنوز بودجه‌ای تنظیم نشده. از ⚙️ تنظیمات یا /budget بودجه رو تنظیم کن."
     label = _period_label(household_id)
     period_end_str = b["period_end"].strftime("%Y-%m-%d")
-    return (
+    text = (
         f"💰 وضعیت بودجه {label}\n\n"
         f"بودجه: {fmt(b['budget'], cur)}\n"
         f"درآمد اضافه‌شده: {fmt(b['period_income'], cur)}\n"
@@ -682,6 +901,13 @@ def _balance_text(household_id):
         f"هزینه امروز: {fmt(b['day_expense'], cur)}\n\n"
         f"📅 {b['days_left_in_period']} روز تا پایان این بازه ({period_end_str})"
     )
+    cat_budgets = db.get_category_budgets_with_spent(household_id)
+    if cat_budgets:
+        text += "\n\n📁 بودجه دسته‌ها:"
+        for r in cat_budgets:
+            icon = "🔴" if r["remaining"] < 0 else ""
+            text += f"\n• {r['category']}: {fmt(r['spent'], cur)} / {fmt(r['budget'], cur)} {icon}"
+    return text
 
 
 @require_household
@@ -761,18 +987,115 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
     await update.message.reply_text(_report_text(household_id, period))
 
 
+def _generate_category_pie_chart(rows):
+    """نمودار دایره‌ای هزینه‌ها به تفکیک دسته می‌سازه و به‌صورت بایت‌های PNG برمی‌گردونه.
+    روی خود عکس فقط شماره می‌ذاریم (نه اسم فارسی دسته)، چون فونت پیش‌فرض matplotlib از حروف
+    فارسی/عربی پشتیبانی نمی‌کنه؛ اسم کامل دسته‌ها رو جدا، به‌صورت کپشن متنی (که تلگرام درست
+    نشون می‌ده) می‌فرستیم."""
+    import io
+    labels = [str(i + 1) for i in range(len(rows))]
+    values = [r["total"] for r in rows]
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    ax.pie(values, labels=labels, autopct="%1.0f%%", startangle=90, colors=plt.cm.tab20.colors)
+    ax.axis("equal")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@require_household
+async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    if not CHART_AVAILABLE:
+        await update.message.reply_text(
+            "رسم نمودار روی این سرور فعال نیست (matplotlib نصب نشده)."
+        )
+        return
+    period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
+    period = period_map.get(context.args[0] if context.args else "month", "month")
+    rows = db.get_category_totals(household_id, period)
+    if not rows:
+        title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+        await update.message.reply_text(f"هزینه‌ای برای {title} ثبت نشده که نمودارش رو بکشم.")
+        return
+
+    cur = db.get_currency(household_id)
+    title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+    total = sum(r["total"] for r in rows)
+    caption_lines = [f"📊 هزینه‌ها بر اساس دسته — {title}\n"]
+    for i, r in enumerate(rows, 1):
+        pct = (r["total"] / total * 100) if total else 0
+        caption_lines.append(f"{i}. {r['category']} — {fmt(r['total'], cur)} ({pct:.0f}٪)")
+
+    chart_buf = _generate_category_pie_chart(rows)
+    await update.message.reply_photo(photo=chart_buf, caption="\n".join(caption_lines))
+
+
 def _categories_text(household_id):
     cats = db.get_categories(household_id)
     lines = ["📁 دسته‌بندی‌ها:\n"]
     for c in cats:
         lines.append(f"• {c['name']}")
-    lines.append("\nبرای اضافه‌کردن دسته جدید با کلمات کلیدی، به پشتیبان بگو یا کد رو ویرایش کن.")
+    lines.append(
+        "\n➕ دسته جدید: /addcategory <نام> | <کلمات کلیدی با کاما (اختیاری)>"
+        "\nمثال: /addcategory آرایشگاه | ارایشگاه,سلمانی,اصلاح"
+        "\n🗑 حذف دسته اختصاصی: /delcategory"
+    )
     return "\n".join(lines)
 
 
 @require_household
 async def categories_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     await update.message.reply_text(_categories_text(household_id))
+
+
+@require_household
+async def addcategory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    raw = " ".join(context.args)
+    if not raw.strip():
+        await update.message.reply_text(
+            "فرمت: /addcategory <نام دسته> | <کلمات کلیدی با کاما (اختیاری)>\n"
+            "مثال: /addcategory آرایشگاه | ارایشگاه,سلمانی,اصلاح"
+        )
+        return
+    if "|" in raw:
+        name, kw = raw.split("|", 1)
+        name, kw = name.strip(), kw.strip()
+    else:
+        name, kw = raw.strip(), ""
+    if not name:
+        await update.message.reply_text("اسم دسته نمی‌تونه خالی باشه.")
+        return
+    db.add_category(household_id, name, kw)
+    await update.message.reply_text(f"✅ دسته «{name}» اضافه شد.")
+
+
+@require_household
+async def delcategory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    cats = db.get_household_only_categories(household_id)
+    if not cats:
+        await update.message.reply_text(
+            "دسته اختصاصی‌ای برای این خانواده نداری (فقط دسته‌های پیش‌فرض هستن که قابل حذف نیستن)."
+        )
+        return
+    buttons = [[InlineKeyboardButton(f"🗑 {c['name']}", callback_data=f"delcat:{c['id']}")] for c in cats]
+    await update.message.reply_text("کدوم دسته حذف بشه؟", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def delcat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    household_id = db.get_user_household(update.effective_user.id)
+    if household_id is None:
+        await query.edit_message_text("اول /start رو بزن.")
+        return
+    cat_id = int(query.data.split(":", 1)[1])
+    removed = db.delete_category(household_id, cat_id)
+    if removed:
+        await query.edit_message_text("✅ دسته حذف شد.")
+    else:
+        await query.edit_message_text("این دسته پیدا نشد یا دسته پیش‌فرضه (قابل حذف نیست).")
 
 
 # ---------------- لیست خرید ----------------
@@ -954,6 +1277,25 @@ def _receipt_confirm_delete_keyboard(receipt_id):
 async def transactions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     text, kb = _tx_list_text_and_keyboard(household_id)
     await update.message.reply_text(text, reply_markup=kb)
+
+
+@require_household
+async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    """آخرین تراکنش ثبت‌شده (هزینه یا درآمد) رو برمی‌گردونه — برای اصلاح سریع اشتباه تایپی."""
+    tx = db.get_last_transaction(household_id)
+    if not tx:
+        await update.message.reply_text("تراکنشی برای برگردوندن پیدا نشد.")
+        return
+    cur = db.get_currency(household_id)
+    db.delete_transaction(tx["id"])
+    type_label = "هزینه" if tx["type"] == "expense" else "درآمد"
+    desc = tx["description"] or tx["category"] or "—"
+    note = ""
+    if tx.get("receipt_id"):
+        note = "\n(این آیتم بخشی از یه فاکتور بود؛ اگه می‌خوای کل فاکتور رو حذف کنی، از /transactions استفاده کن.)"
+    await update.message.reply_text(
+        f"↩️ آخرین تراکنش برگردونده شد: {type_label} {fmt(tx['amount'], cur)} — {desc} (تاریخ {tx['tx_date']}){note}"
+    )
 
 
 async def tx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1498,6 +1840,9 @@ async def _finalize_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     bal = db.get_balance(household_id)
     reply_lines.append(f"\n💰 باقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}")
+    alert = _budget_alert_text(household_id, cur)
+    if alert:
+        reply_lines.append(f"\n{alert}")
     return "\n".join(reply_lines)
 
 
@@ -1672,21 +2017,49 @@ async def _post_init(application: Application):
         BotCommand("balance", "باقیمانده بودجه"),
         BotCommand("recalc", "محاسبه مجدد بودجه و هزینه‌ها"),
         BotCommand("budget", "تنظیم بودجه بازه جاری"),
+        BotCommand("catbudget", "بودجه جداگانه برای یک دسته"),
+        BotCommand("addbill", "تعریف قبض تکرارشونده"),
+        BotCommand("bills", "ثبت سریع قبض‌های تکرارشونده"),
         BotCommand("period", "بازه بودجه: هفتگی یا ماهانه"),
         BotCommand("expense", "ثبت هزینه"),
         BotCommand("income", "ثبت درآمد"),
         BotCommand("report", "گزارش دسته‌بندی‌شده"),
+        BotCommand("chart", "نمودار هزینه‌ها بر اساس دسته"),
         BotCommand("transactions", "تراکنش‌های اخیر (حذف/ویرایش)"),
+        BotCommand("undo", "برگردوندن آخرین تراکنش"),
         BotCommand("newlist", "لیست خرید جدید"),
         BotCommand("list", "نمایش لیست خرید"),
         BotCommand("currency", "تغییر واحد پول"),
         BotCommand("categories", "دسته‌بندی‌ها"),
+        BotCommand("addcategory", "اضافه‌کردن دسته جدید"),
+        BotCommand("delcategory", "حذف دسته اختصاصی"),
         BotCommand("invite", "کد دعوت خانواده"),
+        BotCommand("members", "اعضای خانواده"),
         BotCommand("join", "پیوستن به خانواده‌ای دیگر"),
         BotCommand("backup", "دریافت نسخه پشتیبان دیتابیس"),
         BotCommand("restore", "بازگردانی دیتابیس از فایل بک‌آپ"),
         BotCommand("help", "راهنما"),
     ])
+
+
+async def _send_period_end_reports(context: ContextTypes.DEFAULT_TYPE):
+    """هر روز یه‌بار اجرا می‌شه (job زمان‌بندی‌شده). برای خانواده‌هایی که امروز آخرین روز بازه
+    بودجه‌شونه (هفتگی یا ماهانه)، گزارش خلاصه بازه رو خودکار برای همه اعضا می‌فرسته."""
+    today = date.today()
+    for household_id in db.get_all_household_ids():
+        try:
+            start, end, period_key, period_type = db.get_current_period_bounds(household_id, today)
+            if end != today:
+                continue
+            label = "هفتگی" if period_type == "weekly" else "ماهانه"
+            text = f"📬 گزارش پایان بازه بودجه ({label})\n\n" + _balance_text(household_id) + "\n\n" + _report_text(household_id, "period")
+            for m in db.get_household_members(household_id):
+                try:
+                    await context.bot.send_message(chat_id=m["telegram_id"], text=text)
+                except Exception:
+                    logger.exception(f"Failed to send period-end report to {m['telegram_id']}")
+        except Exception:
+            logger.exception(f"Failed to build period-end report for household {household_id}")
 
 
 def main():
@@ -1701,18 +2074,26 @@ def main():
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("invite", invite_cmd))
+    app.add_handler(CommandHandler("members", members_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("budget", budget_cmd))
+    app.add_handler(CommandHandler("catbudget", catbudget_cmd))
+    app.add_handler(CommandHandler("addbill", addbill_cmd))
+    app.add_handler(CommandHandler("bills", bills_cmd))
     app.add_handler(CommandHandler("period", period_cmd))
     app.add_handler(CommandHandler("income", income_cmd))
     app.add_handler(CommandHandler("expense", expense_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("recalc", recalc_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("chart", chart_cmd))
     app.add_handler(CommandHandler("transactions", transactions_cmd))
+    app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("categories", categories_cmd))
+    app.add_handler(CommandHandler("addcategory", addcategory_cmd))
+    app.add_handler(CommandHandler("delcategory", delcategory_cmd))
     app.add_handler(CommandHandler("currency", currency_cmd))
     app.add_handler(CommandHandler("newlist", newlist_cmd))
     app.add_handler(CommandHandler("donelist", donelist_cmd))
@@ -1726,11 +2107,24 @@ def main():
     app.add_handler(CallbackQueryHandler(excat_callback, pattern=r"^excat:"))
     app.add_handler(CallbackQueryHandler(rcpt_callback, pattern=r"^rcpt:"))
     app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
+    app.add_handler(CallbackQueryHandler(member_callback, pattern=r"^member:"))
+    app.add_handler(CallbackQueryHandler(delcat_callback, pattern=r"^delcat:"))
+    app.add_handler(CallbackQueryHandler(bill_callback, pattern=r"^bill:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     # restore_document_handler باید قبل از document_handler عادی بررسی بشه (وقتی منتظر فایل بک‌آپیم)
     app.add_handler(MessageHandler(filters.Document.ALL, restore_document_handler), group=-1)
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
+
+    if app.job_queue:
+        # هر روز ساعت ۲۱:۰۰ (به وقت سرور) چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
+        # بازه بودجه‌شونه واقعاً پیام می‌فرسته
+        app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0))
+    else:
+        logger.warning(
+            "JobQueue در دسترس نیست (پکیج python-telegram-bot[job-queue] نصب نشده)؛ "
+            "گزارش خودکار پایان بازه غیرفعاله."
+        )
 
     logger.info("Bot starting (polling)...")
     app.run_polling()
