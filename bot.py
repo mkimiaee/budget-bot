@@ -4,6 +4,7 @@
 """
 import logging
 import os
+import shutil
 import uuid
 from datetime import date, timedelta
 
@@ -23,6 +24,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -170,7 +172,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
         "/invite — گرفتن کد دعوت خانواده\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
-        "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n\n"
+        "/backup — دریافت نسخه پشتیبان کامل دیتابیس (بودجه، تراکنش‌ها، لیست خرید)\n"
+        "/restore — بازگردانی دیتابیس از یه فایل بک‌آپ قدیمی (کل دیتابیس فعلی رو جایگزین می‌کنه)\n\n"
         "📷 عکس فاکتور یا 📄 فایل PDF فاکتور بفرست تا خودکار با لیست خریدت تطبیق داده بشه و هزینه‌ها ثبت بشن.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
@@ -201,6 +204,77 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
             )
     except FileNotFoundError:
         await update.message.reply_text("فایل دیتابیس پیدا نشد.")
+
+
+# ---------------- بازگردانی دیتابیس از بک‌آپ ----------------
+# نکته: این دستور عمداً با @require_household محافظت نشده، چون دقیقاً همون موقعی
+# به‌کار میاد که دیتابیس (و در نتیجه خانواده‌ی کاربر) از بین رفته باشه.
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["awaiting_restore"] = True
+    await update.message.reply_text(
+        "📥 فایل بک‌آپ (.db) که قبلاً با /backup گرفتی رو همینجا به‌صورت File بفرست.\n"
+        "بعد از دریافت فایل، قبل از جایگزین‌کردن ازت تایید می‌گیرم."
+    )
+
+
+async def restore_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اگه کاربر با /restore منتظر فایل بک‌آپه، این فایل رو می‌گیره و برای تایید نشون می‌ده.
+    اگه منتظر نیستیم، کاری نمی‌کنه تا document_handler عادی (فاکتور/OCR) پردازشش کنه."""
+    if not context.chat_data.get("awaiting_restore"):
+        return
+    context.chat_data.pop("awaiting_restore", None)
+    doc = update.message.document
+    file = await doc.get_file()
+    data = bytes(await file.download_as_bytearray())
+    if not data.startswith(b"SQLite format 3\x00"):
+        await update.message.reply_text(
+            "این فایل یه دیتابیس SQLite معتبر نیست (باید همون فایلی باشه که با /backup گرفتی). لغو شد."
+        )
+        raise ApplicationHandlerStop
+    context.chat_data["pending_restore_bytes"] = data
+    await update.message.reply_text(
+        "⚠️ این کار *کل* دیتابیس فعلی (بودجه، تراکنش‌ها، لیست‌های خرید همه اعضای خانواده) رو با این فایل "
+        "جایگزین می‌کنه و قابل بازگشت نیست.\nمطمئنی؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ بله، جایگزین کن", callback_data="restore:confirm")],
+            [InlineKeyboardButton("❌ نه، بی‌خیال", callback_data="restore:cancel")],
+        ]),
+    )
+    raise ApplicationHandlerStop
+
+
+async def restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "cancel":
+        context.chat_data.pop("pending_restore_bytes", None)
+        await query.edit_message_text("بازگردانی لغو شد. دیتابیس فعلی دست‌نخورده موند.")
+        return
+
+    data = context.chat_data.pop("pending_restore_bytes", None)
+    if not data:
+        await query.edit_message_text("فایلی برای بازگردانی پیدا نشد. دوباره /restore رو بزن.")
+        return
+
+    try:
+        os.makedirs(os.path.dirname(db.DB_PATH), exist_ok=True)
+        if os.path.exists(db.DB_PATH):
+            shutil.copyfile(db.DB_PATH, db.DB_PATH + ".before-restore")
+        with open(db.DB_PATH, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        logger.exception("Restore failed")
+        await query.edit_message_text(f"بازگردانی ناموفق بود: {e}")
+        return
+
+    await query.edit_message_text(
+        "✅ دیتابیس بازگردانی شد.\n"
+        "برای پاک‌شدن کامل حالت‌های قدیمی، از داشبورد Railway سرویس رو یه‌بار Restart کن؛ "
+        "بعد هر دستوری (مثلاً /balance یا /list) بزن تا مطمئن بشی اطلاعات قبلی برگشته."
+    )
 
 
 async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1520,6 +1594,7 @@ async def _post_init(application: Application):
         BotCommand("invite", "کد دعوت خانواده"),
         BotCommand("join", "پیوستن به خانواده‌ای دیگر"),
         BotCommand("backup", "دریافت نسخه پشتیبان دیتابیس"),
+        BotCommand("restore", "بازگردانی دیتابیس از فایل بک‌آپ"),
         BotCommand("help", "راهنما"),
     ])
 
@@ -1538,6 +1613,7 @@ def main():
     app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("budget", budget_cmd))
     app.add_handler(CommandHandler("period", period_cmd))
     app.add_handler(CommandHandler("income", income_cmd))
@@ -1559,7 +1635,10 @@ def main():
     app.add_handler(CallbackQueryHandler(exp_callback, pattern=r"^exp:"))
     app.add_handler(CallbackQueryHandler(excat_callback, pattern=r"^excat:"))
     app.add_handler(CallbackQueryHandler(rcpt_callback, pattern=r"^rcpt:"))
+    app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # restore_document_handler باید قبل از document_handler عادی بررسی بشه (وقتی منتظر فایل بک‌آپیم)
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_document_handler), group=-1)
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
 
