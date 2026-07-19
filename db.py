@@ -471,6 +471,51 @@ def get_category_budgets_with_spent(household_id):
         return result
 
 
+def get_next_period_bounds(household_id, ref_date=None):
+    """بازه‌ی بعدی (هفته/ماه آینده) که بلافاصله بعد از بازه جاری شروع می‌شود را برمی‌گرداند."""
+    start, end, period_key, period_type = get_current_period_bounds(household_id, ref_date)
+    return get_current_period_bounds(household_id, end + timedelta(days=1))
+
+
+def carry_over_next_period_budget(household_id):
+    """با تایید کاربر (وقتی بازه جاری تمام می‌شود)، بودجه کلی و بودجه‌های دسته‌ای بازه جاری را
+    عیناً برای بازه بعدی (هفته/ماه آینده، با همان ویژگی‌های بازه فعلی — همون نوع بازه، روز شروع،
+    دسته‌بندی‌ها و غیره که در سطح خانواده ذخیره شده‌اند و از قبل تغییری نمی‌کنند) کپی می‌کند، تا با
+    شروع بازه جدید همون بودجه از قبل آماده باشد. اگر بازه بعدی از قبل بودجه‌ی کلی داشته باشد (چون
+    کاربر قبلاً همین دکمه را زده یا دستی با /budget برای بازه بعدی چیزی تنظیم کرده)، کاری انجام
+    نمی‌دهد و False برمی‌گرداند (برای جلوگیری از دوباره‌کاری وقتی چند عضو خانواده روی دکمه تایید بزنند)."""
+    start, end, period_key, period_type = get_current_period_bounds(household_id)
+    n_start, n_end, n_period_key, n_period_type = get_next_period_bounds(household_id)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM budgets WHERE household_id=? AND period_type=? AND period_key=?",
+            (household_id, n_period_type, n_period_key),
+        ).fetchone()
+        if existing:
+            return False
+        current = conn.execute(
+            "SELECT amount FROM budgets WHERE household_id=? AND period_type=? AND period_key=? ORDER BY id DESC LIMIT 1",
+            (household_id, period_type, period_key),
+        ).fetchone()
+        if current is None:
+            return False
+        conn.execute(
+            "INSERT INTO budgets (household_id, period_type, amount, period_key, created_at) VALUES (?, ?, ?, ?, ?)",
+            (household_id, n_period_type, current["amount"], n_period_key, datetime.utcnow().isoformat()),
+        )
+        cat_rows = conn.execute(
+            "SELECT category, amount FROM category_budgets WHERE household_id=? AND period_type=? AND period_key=?",
+            (household_id, period_type, period_key),
+        ).fetchall()
+        for r in cat_rows:
+            conn.execute(
+                """INSERT INTO category_budgets (household_id, category, period_type, amount, period_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (household_id, r["category"], n_period_type, r["amount"], n_period_key, datetime.utcnow().isoformat()),
+            )
+        return True
+
+
 # ---------- اتصال ایمیل برای خوندن خودکار فاکتور ----------
 
 def set_email_account(household_id, email_address, app_password, imap_host="imap.gmail.com",

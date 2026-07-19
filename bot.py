@@ -1595,6 +1595,22 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(فرمت: 2026-07-13) تا روز هفته‌اش رو خودم پیدا کنم."
         )
 
+    elif action == "carryover" and len(parts) > 2 and parts[2] == "yes":
+        applied = db.carry_over_next_period_budget(household_id)
+        if applied:
+            await query.edit_message_text(
+                "✅ باشه — بازه بعدی هم با همون بودجه (و همون بودجه‌های دسته‌ای) شروع می‌شه، خودکار."
+            )
+        else:
+            await query.edit_message_text(
+                "این قبلاً انجام شده بود (یا یکی دیگه از اعضا قبل از تو تایید کرده)."
+            )
+
+    elif action == "carryover" and len(parts) > 2 and parts[2] == "no":
+        await query.edit_message_text(
+            "باشه، کاری نکردم. هروقت بازه جدید شروع شد، خودت با /budget بودجه‌ش رو تنظیم کن."
+        )
+
     elif action == "currency":
         context.chat_data["awaiting"] = "currency"
         await query.edit_message_text("واحد پول جدید رو بفرست، مثلاً: EUR یا یورو یا $")
@@ -2310,9 +2326,20 @@ async def _send_period_end_reports(context: ContextTypes.DEFAULT_TYPE):
                 continue
             label = "هفتگی" if period_type == "weekly" else "ماهانه"
             text = f"📬 گزارش پایان بازه بودجه ({label})\n\n" + _balance_text(household_id) + "\n\n" + _report_text(household_id, "period")
+
+            budget = db.get_budget(household_id)
+            kb = None
+            if budget:
+                cur = db.get_currency(household_id)
+                text += f"\n\n🔁 بازه بعدی هم با همین بودجه ({fmt(budget, cur)}) شروع بشه؟"
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ بله، همون بودجه", callback_data="m:carryover:yes"),
+                    InlineKeyboardButton("❌ نه", callback_data="m:carryover:no"),
+                ]])
+
             for m in db.get_household_members(household_id):
                 try:
-                    await context.bot.send_message(chat_id=m["telegram_id"], text=text)
+                    await context.bot.send_message(chat_id=m["telegram_id"], text=text, reply_markup=kb)
                 except Exception:
                     logger.exception(f"Failed to send period-end report to {m['telegram_id']}")
         except Exception:
