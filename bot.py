@@ -1076,7 +1076,11 @@ def _report_text_periods(r, cur, title):
         lines.append("")
 
     lines.append(f"جمع کل {title} (داخل بودجه): {fmt(r['total'], cur)}")
-    lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
+    today_str = date.today().isoformat()
+    if r["start"] <= today_str <= r["end"]:
+        # فقط وقتی امروز واقعاً داخل بازه‌ی درخواستی باشه نشون بده — برای یه بازه/هفته گذشته
+        # (مثلاً از دکمه‌های بازه‌های اخیر) نشون دادن «هزینه امروز» گمراه‌کننده‌ست.
+        lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
     if r["side_total"]:
         lines.append(f"جمع کل هزینه‌های جانبی: {fmt(r['side_total'], cur)}")
 
