@@ -152,11 +152,36 @@ def _groups_table(groups, cur, cell_style, header_style):
     return table
 
 
+def _render_expense_section(story, groups, total, side_total, currency, styles, show_budget_heading=True):
+    """یه بخش گزارش (جدول هزینه‌های داخل بودجه + جدول هزینه‌های جانبی، با جمع‌هاشون) رو به story
+    اضافه می‌کنه. برای استفاده مشترک بین گزارش تخت و هر بازه‌ی گزارش تفکیک‌شده بر اساس بازه بودجه."""
+    heading_style, normal_style, cell_style, total_style = styles
+    budget_groups = [g for g in groups if g.get("in_budget", 1)]
+    side_groups = [g for g in groups if not g.get("in_budget", 1)]
+
+    if budget_groups:
+        if show_budget_heading:
+            story.append(Paragraph(rtl("هزینه‌های داخل بودجه"), heading_style))
+        story.append(_groups_table(budget_groups, currency, cell_style, heading_style))
+    else:
+        story.append(Paragraph(rtl("هزینه‌ای داخل بودجه ثبت نشده."), normal_style))
+    story.append(Paragraph(rtl(f"جمع (داخل بودجه): {_fmt(total, currency)}"), total_style))
+
+    if side_groups:
+        story.append(Paragraph(rtl("📎 هزینه‌های جانبی (خارج از بودجه)"), heading_style))
+        story.append(_groups_table(side_groups, currency, cell_style, heading_style))
+        story.append(Paragraph(rtl(f"جمع هزینه‌های جانبی: {_fmt(side_total, currency)}"), total_style))
+
+
 def build_report_pdf(title, report, currency):
     """
-    گزارش (خروجی db.get_report یا db.get_report_by_dates) رو به یه فایل PDF تبدیل می‌کنه.
+    گزارش رو به یه فایل PDF تبدیل می‌کنه. دو نوع ورودی پشتیبانی می‌شه:
+      ۱) خروجی db.get_report / db.get_report_by_dates: dict با کلیدهای groups/total/side_total —
+         یه لیست تخت (بدون تفکیک بر اساس بازه بودجه).
+      ۲) خروجی db.get_report_by_periods: dict با کلید periods (لیستی از بخش‌ها، هرکدوم با
+         start/end/groups/total/side_total خودش) — چون بودجه ممکنه هفتگی باشه، یه گزارش ماهانه چند
+         بازه بودجه مختلف رو در بر می‌گیره و هرکدوم با زیرعنوان و جمع خودش جدا نشون داده می‌شه.
     title: عنوان بازه (مثلاً 'این ماه' یا '2026-06-01 تا 2026-06-30').
-    report: dict با کلیدهای groups/total/side_total (همون چیزی که db.get_report برمی‌گردونه).
     currency: واحد پول برای فرمت‌کردن مبلغ‌ها (مثل fmt تو bot.py).
     خروجی: io.BytesIO آماده برای ارسال به‌عنوان فایل.
     """
@@ -167,28 +192,40 @@ def build_report_pdf(title, report, currency):
         title=title,
     )
     title_style, heading_style, normal_style, cell_style, total_style = _styles()
-
-    groups = report.get("groups", [])
-    budget_groups = [g for g in groups if g.get("in_budget", 1)]
-    side_groups = [g for g in groups if not g.get("in_budget", 1)]
+    styles = (heading_style, normal_style, cell_style, total_style)
 
     story = [
         Paragraph(rtl(f"🧾 گزارش هزینه‌ها — {title}"), title_style),
         Spacer(1, 6 * mm),
     ]
 
-    if budget_groups:
-        story.append(Paragraph(rtl("هزینه‌های داخل بودجه"), heading_style))
-        story.append(_groups_table(budget_groups, currency, cell_style, heading_style))
+    if "periods" in report:
+        non_empty = [p for p in report["periods"] if p["groups"]]
+        multi = len(report["periods"]) > 1
+        if not non_empty:
+            story.append(Paragraph(rtl("هزینه‌ای برای این بازه ثبت نشده."), normal_style))
+        for p in report["periods"]:
+            if not p["groups"]:
+                continue
+            if multi:
+                p_title = p["start"] if p["start"] == p["end"] else f"{p['start']} تا {p['end']}"
+                story.append(Paragraph(rtl(f"📆 بازه بودجه {p_title}"), heading_style))
+            _render_expense_section(
+                story, p["groups"], p["total"], p["side_total"], currency, styles,
+                show_budget_heading=not multi,
+            )
+            story.append(Spacer(1, 5 * mm))
+        if multi:
+            story.append(Paragraph(rtl(f"جمع کل (داخل بودجه): {_fmt(report.get('total', 0), currency)}"), total_style))
+            if report.get("side_total"):
+                story.append(Paragraph(
+                    rtl(f"جمع کل هزینه‌های جانبی: {_fmt(report.get('side_total', 0), currency)}"), total_style,
+                ))
     else:
-        story.append(Paragraph(rtl("هزینه‌ای داخل بودجه ثبت نشده."), normal_style))
-
-    story.append(Paragraph(rtl(f"جمع (داخل بودجه): {_fmt(report.get('total', 0), currency)}"), total_style))
-
-    if side_groups:
-        story.append(Paragraph(rtl("📎 هزینه‌های جانبی (خارج از بودجه)"), heading_style))
-        story.append(_groups_table(side_groups, currency, cell_style, heading_style))
-        story.append(Paragraph(rtl(f"جمع هزینه‌های جانبی: {_fmt(report.get('side_total', 0), currency)}"), total_style))
+        _render_expense_section(
+            story, report.get("groups", []), report.get("total", 0), report.get("side_total", 0),
+            currency, styles,
+        )
 
     doc.build(story)
     buf.seek(0)

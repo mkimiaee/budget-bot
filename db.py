@@ -799,6 +799,53 @@ def _report_period_bounds(household_id, period):
     return today.replace(day=1).isoformat(), today.isoformat()
 
 
+def report_period_bounds(household_id, period):
+    """نسخه عمومی _report_period_bounds — برای وقتی جای دیگه‌ای (مثل ساخت گزارشِ تفکیک‌شده بر
+    اساس بازه بودجه) لازمه بازه تاریخ یکی از برچسب‌های آماده گزارش رو بدونه."""
+    return _report_period_bounds(household_id, period)
+
+
+def get_periods_in_range(household_id, start, end):
+    """بازه [start,end] (رشته YYYY-MM-DD) را به بازه‌های بودجه‌ای *واقعی* خانواده (هفتگی یا ماهانه،
+    با همون روز شروع هفته‌ای که تو تنظیمات انتخاب شده) تقسیم می‌کنه — دقیقاً همون مرزهایی که
+    get_current_period_bounds برای خودِ محاسبه بودجه استفاده می‌کنه. این‌جوری مثلاً روز دوشنبه‌ای که
+    یه بازه بودجه هفتگی جدید ازش شروع می‌شه، اشتباهی جزو بازه هفته قبل حساب نمی‌شه.
+    خروجی: لیستی از {"start":.., "end":..} به ترتیب زمانی (رشته ISO). بازه اول/آخر ممکنه به‌خاطر
+    برخورد با start/end درخواستی، کوتاه‌تر از یک بازه بودجه کامل باشه."""
+    start_d, end_d = _parse_iso_date(start), _parse_iso_date(end)
+    periods = []
+    cursor = start_d
+    while cursor <= end_d:
+        p_start, p_end, _, _ = get_current_period_bounds(household_id, cursor)
+        clipped_start = max(p_start, start_d)
+        clipped_end = min(p_end, end_d)
+        periods.append({"start": clipped_start.isoformat(), "end": clipped_end.isoformat()})
+        cursor = p_end + timedelta(days=1)
+    return periods
+
+
+def get_report_by_periods(household_id, start, end):
+    """مثل get_report_by_dates ولی گزارش رو بر اساس بازه‌های بودجه واقعی خانواده (هفتگی/ماهانه، طبق
+    تنظیمات) به بخش‌های جدا تقسیم می‌کنه — هر بخش گزارش و جمع بازه بودجه‌ی خودش رو داره. اگه کل
+    [start,end] فقط داخل یک بازه بودجه باشه، فقط یه بخش تو periods برمی‌گرده."""
+    period_bounds = get_periods_in_range(household_id, start, end)
+    periods = []
+    total, side_total, today_total = 0.0, 0.0, 0.0
+    for pb in period_bounds:
+        r = get_report_by_dates(household_id, pb["start"], pb["end"])
+        periods.append({
+            "start": pb["start"], "end": pb["end"], "groups": r["groups"],
+            "total": r["total"], "side_total": r["side_total"],
+        })
+        total += r["total"]
+        side_total += r["side_total"]
+        today_total = r["today_total"]  # برای همه بخش‌ها یکسانه (هزینه امروز)
+    return {
+        "start": start, "end": end, "periods": periods,
+        "total": total, "side_total": side_total, "today_total": today_total,
+    }
+
+
 def _parse_iso_date(s):
     return date.fromisoformat(s) if isinstance(s, str) else s
 

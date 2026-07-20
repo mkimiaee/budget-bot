@@ -1027,14 +1027,70 @@ def _report_text_core(r, cur, title, show_date_headers):
     return "\n".join(lines)
 
 
+def _period_section_title(p):
+    return p["start"] if p["start"] == p["end"] else f"{p['start']} تا {p['end']}"
+
+
+def _report_text_periods(r, cur, title):
+    """رندر متنی گزارش تفکیک‌شده بر اساس بازه‌های بودجه *واقعی* خانواده (خروجی db.get_report_by_periods)
+    — چون بودجه ممکنه هفتگی باشه، یه گزارش ماهانه چند تا بازه بودجه مختلف رو در بر می‌گیره و باید هر
+    کدوم با جمع خودش جدا نشون داده بشه (نه یه لیست تخت). اگه کل بازه فقط یه بازه بودجه رو شامل بشه
+    (مثلاً گزارش «این هفته» یا یه بازه دلخواه کوتاه‌تر از یه بازه بودجه)، بدون زیرعنوان اضافه، دقیقاً
+    مثل قبل نشون داده می‌شه."""
+    non_empty = [p for p in r["periods"] if p["groups"]]
+    if not non_empty:
+        return f"هیچ هزینه‌ای برای {title} ثبت نشده."
+
+    multi = len(r["periods"]) > 1
+    lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
+
+    for p in r["periods"]:
+        budget_groups = [g for g in p["groups"] if g.get("in_budget", 1)]
+        side_groups = [g for g in p["groups"] if not g.get("in_budget", 1)]
+        if not budget_groups and not side_groups:
+            continue
+        if multi:
+            lines.append(f"━━━ 📆 بازه بودجه {_period_section_title(p)} ━━━")
+        if budget_groups:
+            lines.extend(_render_report_groups(budget_groups, cur, "week"))
+        else:
+            lines.append("(هزینه‌ای داخل بودجه ثبت نشده)")
+        if multi:
+            lines.append(f"جمع این بازه (داخل بودجه): {fmt(p['total'], cur)}")
+        if side_groups:
+            lines.append("📎 هزینه‌های جانبی این بازه:")
+            lines.extend(_render_report_groups(side_groups, cur, "week"))
+            lines.append(f"جمع هزینه‌های جانبی این بازه: {fmt(p['side_total'], cur)}")
+        lines.append("")
+
+    lines.append(f"جمع کل {title} (داخل بودجه): {fmt(r['total'], cur)}")
+    lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
+    if r["side_total"]:
+        lines.append(f"جمع کل هزینه‌های جانبی: {fmt(r['side_total'], cur)}")
+
+    return "\n".join(lines).rstrip()
+
+
+def _report_has_expenses(r):
+    if "periods" in r:
+        return any(p["groups"] for p in r["periods"])
+    return bool(r["groups"])
+
+
 def _report_text(household_id, period):
     """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
-    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز)."""
+    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز).
+    برای «این ماه» چون ممکنه چند بازه بودجه هفتگی رو در بر بگیره، بر اساس بازه‌های واقعی بودجه
+    تفکیک می‌شه؛ برای «امروز»/«این هفته» (که همیشه دقیقاً یه بازه بودجه‌ن) به همون شکل قبلی می‌مونه."""
     cur = db.get_currency(household_id)
     period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
     period = period_map.get(period, "month")
-    r = db.get_report(household_id, period)
     title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+    if period == "month":
+        start, end = db.report_period_bounds(household_id, "month")
+        r = db.get_report_by_periods(household_id, start, end)
+        return _report_text_periods(r, cur, title)
+    r = db.get_report(household_id, period)
     return _report_text_core(r, cur, title, show_date_headers=(period != "day"))
 
 
@@ -1043,11 +1099,12 @@ def _report_title_for_range(start, end):
 
 
 def _report_text_range(household_id, start, end):
-    """مثل _report_text ولی برای یک بازه تاریخ دلخواه (start/end رشته YYYY-MM-DD)."""
+    """مثل _report_text ولی برای یک بازه تاریخ دلخواه (start/end رشته YYYY-MM-DD)؛ اینم بر اساس
+    بازه‌های واقعی بودجه تفکیک می‌شه (ممکنه چند بازه هفتگی/ماهانه رو در بر بگیره)."""
     cur = db.get_currency(household_id)
-    r = db.get_report_by_dates(household_id, start, end)
+    r = db.get_report_by_periods(household_id, start, end)
     title = _report_title_for_range(start, end)
-    return _report_text_core(r, cur, title, show_date_headers=True)
+    return _report_text_periods(r, cur, title)
 
 
 @require_household
@@ -1849,13 +1906,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parts[2] == "custom" and len(parts) > 4:
             start, end = parts[3], parts[4]
             title = _report_title_for_range(start, end)
-            r = db.get_report_by_dates(household_id, start, end)
+            r = db.get_report_by_periods(household_id, start, end)
         else:
             period = parts[2]
             title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
-            r = db.get_report(household_id, period)
+            if period == "month":
+                start, end = db.report_period_bounds(household_id, "month")
+                r = db.get_report_by_periods(household_id, start, end)
+            else:
+                r = db.get_report(household_id, period)
         cur = db.get_currency(household_id)
-        if not r["groups"]:
+        if not _report_has_expenses(r):
             await query.answer(f"هزینه‌ای برای {title} ثبت نشده که PDF بسازم.", show_alert=True)
             return
         await query.answer("در حال ساخت PDF…")
