@@ -11,6 +11,11 @@ from contextlib import contextmanager
 from collections import Counter
 
 DB_PATH = os.environ.get("BOT_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "bot.db"))
+# اگه BOT_DB_PATH به یه پوشه اشاره کنه (نه فایل دیتابیس) — مثلاً روی Railway که یه Volume مستقیم
+# رو یه پوشه مثل /app/data مونت می‌شه — sqlite نمی‌تونه اون پوشه رو به‌عنوان فایل باز کنه و با خطای
+# "unable to open database file" کرش می‌کنه. اینجا خودکار تشخیص می‌دیم و اسم فایل رو بهش اضافه می‌کنیم.
+if os.path.isdir(DB_PATH):
+    DB_PATH = os.path.join(DB_PATH, "bot.db")
 
 # واحد پول پیش‌فرض برای خانواده‌های جدید؛ با متغیر محیطی DEFAULT_CURRENCY قابل تنظیم است.
 # هر خانواده بعداً می‌تواند با دستور /currency آن را برای خودش عوض کند.

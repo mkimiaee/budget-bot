@@ -27,8 +27,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # دیتابیس SQLite داخل این پوشه ذخیره می‌شود؛ روی Railway یک Volume به این مسیر وصل کنید
-# تا اطلاعات بعد از هر دیپلوی جدید پاک نشوند.
+# تا اطلاعات بعد از هر دیپلوی جدید پاک نشوند. توجه: BOT_DB_PATH باید مسیر خودِ فایل دیتابیس باشه
+# نه فقط پوشه‌ش — وگرنه sqlite با خطای "unable to open database file" کرش می‌کنه.
 RUN mkdir -p /app/data
-ENV BOT_DB_PATH=/app/data
+ENV BOT_DB_PATH=/app/data/bot.db
 
 CMD ["python", "bot.py"]
