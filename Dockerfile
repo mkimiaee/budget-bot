@@ -1,11 +1,11 @@
 FROM python:3.11-slim
 
 # tesseract + پک زبان فارسی برای خواندن فاکتورها
-# fonts-noto-naskh-arabic: فونتی که حروف فارسی/عربی داره، برای نمایش درست متن فارسی تو خروجی PDF گزارش‌ها
+# fonts-noto-core: شامل NotoSansArabic (حروف فارسی/عربی) برای نمایش درست متن فارسی تو خروجی PDF گزارش‌ها
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-fas \
-    fonts-noto-naskh-arabic \
+    fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
