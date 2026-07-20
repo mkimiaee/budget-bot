@@ -805,6 +805,22 @@ def report_period_bounds(household_id, period):
     return _report_period_bounds(household_id, period)
 
 
+def get_recent_periods(household_id, n=4, ref_date=None):
+    """آخرین n بازه بودجه واقعی خانواده (هفتگی یا ماهانه، طبق تنظیمات فعلی) رو برمی‌گردونه، از قدیم
+    به جدید، شامل بازه جاری (ناقص اگه هنوز تموم نشده). برای نمایش دکمه‌های انتخاب سریع بازه گزارش
+    استفاده می‌شه — به‌جای اینکه کاربر مجبور باشه تاریخ دقیق بازه بودجه‌ش رو حفظ باشه و دستی بزنه.
+    خروجی: لیستی از {"start":.., "end":..} (رشته ISO)."""
+    ref_date = ref_date or date.today()
+    periods = []
+    cursor = ref_date
+    for _ in range(n):
+        p_start, p_end, _, _ = get_current_period_bounds(household_id, cursor)
+        periods.append({"start": p_start.isoformat(), "end": p_end.isoformat()})
+        cursor = p_start - timedelta(days=1)
+    periods.reverse()
+    return periods
+
+
 def get_periods_in_range(household_id, start, end):
     """بازه [start,end] (رشته YYYY-MM-DD) را به بازه‌های بودجه‌ای *واقعی* خانواده (هفتگی یا ماهانه،
     با همون روز شروع هفته‌ای که تو تنظیمات انتخاب شده) تقسیم می‌کنه — دقیقاً همون مرزهایی که

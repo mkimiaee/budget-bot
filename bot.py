@@ -182,6 +182,18 @@ def _report_pdf_keyboard(pdf_callback_data):
     ])
 
 
+def _recent_periods_keyboard(household_id):
+    """کیبورد انتخاب سریع یکی از ۴ بازه بودجه اخیر (هفتگی یا ماهانه، با تاریخ واقعی خودشون) —
+    به‌جای اینکه کاربر مجبور باشه تاریخ دقیق بازه‌ش رو حفظ باشه و دستی تایپ کنه."""
+    periods = db.get_recent_periods(household_id, n=4)
+    buttons = []
+    for p in reversed(periods):  # جدیدترین بازه اول نشون داده بشه
+        label = p["start"] if p["start"] == p["end"] else f"{p['start']} تا {p['end']}"
+        buttons.append([InlineKeyboardButton(f"📆 {label}", callback_data=f"m:report:range:{p['start']}:{p['end']}")])
+    buttons.append([InlineKeyboardButton("✍️ یه بازه دیگه (خودم می‌نویسم)", callback_data="m:report:customtype")])
+    return InlineKeyboardMarkup(buttons)
+
+
 # ---------------- دستورات پایه ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1886,10 +1898,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_photo(photo=chart_buf, caption="\n".join(caption_lines))
 
     elif action == "report" and len(parts) > 2 and parts[2] == "custom":
+        await query.edit_message_text(
+            "کدوم بازه رو می‌خوای؟ یکی از بازه‌های اخیر بودجه‌ت رو بزن، یا خودت یه بازه دیگه بنویس:",
+            reply_markup=_recent_periods_keyboard(household_id),
+        )
+
+    elif action == "report" and len(parts) > 2 and parts[2] == "customtype":
         context.chat_data["awaiting"] = "report_range_start"
         await query.edit_message_text(
             "بازه‌ی گزارش رو با دو تا پیام بهم بگو.\n"
             "اول تاریخ شروع رو بفرست (میلادی، مثلاً 2026-06-01):"
+        )
+
+    elif action == "report" and len(parts) > 2 and parts[2] == "range" and len(parts) > 4:
+        start, end = parts[3], parts[4]
+        await query.edit_message_text(
+            _report_text_range(household_id, start, end),
+            reply_markup=_report_pdf_keyboard(f"m:reportpdf:custom:{start}:{end}"),
         )
 
     elif action == "report" and len(parts) > 2:
