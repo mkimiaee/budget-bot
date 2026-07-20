@@ -26,18 +26,22 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 import arabic_reshaper
 from bidi.algorithm import get_display
 
-# مسیرهای معمول فونت فارسی/عربی روی سیستم‌های دبیان-بیس (پکیج fonts-noto-naskh-arabic)
+# اولویت با فونت وزیر (Vazirmatn) — تو Dockerfile مستقیم از jsDelivr دانلود می‌شه. اگه نبود (مثلاً
+# دانلودش موقع build شکست خورده)، Noto Sans Arabic (از پکیج دبیان fonts-noto-core) به‌عنوان
+# fallback مطمئن استفاده می‌شه — حروف فارسی رو داره، فقط ظاهرش شبیه وزیر نیست.
 _FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
 ]
 _BOLD_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
-    "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Bold.ttf",
+    "/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansArabic-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Bold.ttf",
 ]
 
 FONT_NAME = "Helvetica"
@@ -53,7 +57,7 @@ def _find_font(candidates):
     for pattern in ("/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/*.ttc"):
         for path in glob.glob(pattern, recursive=True):
             name = os.path.basename(path).lower()
-            if "naskh" in name or "arabic" in name:
+            if "vazir" in name or "naskh" in name or "arabic" in name:
                 return path
     return None
 
