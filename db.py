@@ -478,40 +478,62 @@ def get_next_period_bounds(household_id, ref_date=None):
 
 
 def carry_over_next_period_budget(household_id):
-    """با تایید کاربر (وقتی بازه جاری تمام می‌شود)، بودجه کلی و بودجه‌های دسته‌ای بازه جاری را
-    عیناً برای بازه بعدی (هفته/ماه آینده، با همان ویژگی‌های بازه فعلی — همون نوع بازه، روز شروع،
-    دسته‌بندی‌ها و غیره که در سطح خانواده ذخیره شده‌اند و از قبل تغییری نمی‌کنند) کپی می‌کند، تا با
-    شروع بازه جدید همون بودجه از قبل آماده باشد. اگر بازه بعدی از قبل بودجه‌ی کلی داشته باشد (چون
-    کاربر قبلاً همین دکمه را زده یا دستی با /budget برای بازه بعدی چیزی تنظیم کرده)، کاری انجام
-    نمی‌دهد و False برمی‌گرداند (برای جلوگیری از دوباره‌کاری وقتی چند عضو خانواده روی دکمه تایید بزنند)."""
-    start, end, period_key, period_type = get_current_period_bounds(household_id)
-    n_start, n_end, n_period_key, n_period_type = get_next_period_bounds(household_id)
+    """با تایید کاربر (وقتی بازه جاری تمام می‌شود)، بودجه کلی و بودجه‌های دسته‌ای بازه‌ای که تازه
+    تموم شده را برای بازه‌ی بعدی که هنوز بودجه‌ای ندارد کپی می‌کند، تا با شروع بازه جدید همون بودجه
+    از قبل آماده باشد.
+
+    این تابع عمداً به «امروز چه روزیه» حساس نیست، چون پیام تاییدیه ساعت ۲۱ روز آخر بازه فرستاده
+    می‌شه ولی ممکنه کاربر خیلی دیرتر (مثلاً فردا صبح، بعد از شروع بازه جدید) روی دکمه بزنه. برای
+    همین به‌جای اینکه فرض کنه «بازه جاری» همون بازه‌ی تازه‌تمام‌شده‌ست، اول چک می‌کنه بازه جاری
+    (همون لحظه‌ی کلیک) بودجه داره یا نه:
+      - اگه نداره (یعنی بازه جدید همین الان شروع شده و کاربر بعد از نیمه‌شب تایید کرده)، همون
+        بازه جاری رو پر می‌کنه.
+      - اگه داره (یعنی هنوز تو بازه قدیمیه و کاربر همون روز آخر تایید کرده)، طبق منطق قبلی بازه
+        *بعدی* رو پر می‌کنه.
+    مبلغ منبع همیشه از آخرین بودجه‌ای که تا الان ثبت شده می‌آید (نه لزوماً بودجه‌ی «بازه جاری»ی
+    محاسبه‌شده در لحظه‌ی کلیک، چون ممکنه اون بازه دیگه بودجه نداشته باشه).
+    اگر بازه هدف از قبل بودجه‌ی کلی داشته باشد (چون کاربر قبلاً همین دکمه را زده یا دستی با /budget
+    چیزی تنظیم کرده)، کاری انجام نمی‌دهد و False برمی‌گرداند (برای جلوگیری از دوباره‌کاری وقتی چند
+    عضو خانواده روی دکمه تایید بزنند)."""
     with get_conn() as conn:
-        existing = conn.execute(
+        last = conn.execute(
+            "SELECT amount, period_type, period_key FROM budgets WHERE household_id=? ORDER BY id DESC LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if last is None:
+            return False
+
+        cur_start, cur_end, cur_period_key, cur_period_type = get_current_period_bounds(household_id)
+        cur_has_budget = conn.execute(
             "SELECT 1 FROM budgets WHERE household_id=? AND period_type=? AND period_key=?",
-            (household_id, n_period_type, n_period_key),
+            (household_id, cur_period_type, cur_period_key),
         ).fetchone()
-        if existing:
-            return False
-        current = conn.execute(
-            "SELECT amount FROM budgets WHERE household_id=? AND period_type=? AND period_key=? ORDER BY id DESC LIMIT 1",
-            (household_id, period_type, period_key),
-        ).fetchone()
-        if current is None:
-            return False
+
+        if not cur_has_budget:
+            target_period_type, target_period_key = cur_period_type, cur_period_key
+        else:
+            n_start, n_end, n_period_key, n_period_type = get_next_period_bounds(household_id)
+            existing = conn.execute(
+                "SELECT 1 FROM budgets WHERE household_id=? AND period_type=? AND period_key=?",
+                (household_id, n_period_type, n_period_key),
+            ).fetchone()
+            if existing:
+                return False
+            target_period_type, target_period_key = n_period_type, n_period_key
+
         conn.execute(
             "INSERT INTO budgets (household_id, period_type, amount, period_key, created_at) VALUES (?, ?, ?, ?, ?)",
-            (household_id, n_period_type, current["amount"], n_period_key, datetime.utcnow().isoformat()),
+            (household_id, target_period_type, last["amount"], target_period_key, datetime.utcnow().isoformat()),
         )
         cat_rows = conn.execute(
             "SELECT category, amount FROM category_budgets WHERE household_id=? AND period_type=? AND period_key=?",
-            (household_id, period_type, period_key),
+            (household_id, last["period_type"], last["period_key"]),
         ).fetchall()
         for r in cat_rows:
             conn.execute(
                 """INSERT INTO category_budgets (household_id, category, period_type, amount, period_key, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (household_id, r["category"], n_period_type, r["amount"], n_period_key, datetime.utcnow().isoformat()),
+                (household_id, r["category"], target_period_type, r["amount"], target_period_key, datetime.utcnow().isoformat()),
             )
         return True
 
