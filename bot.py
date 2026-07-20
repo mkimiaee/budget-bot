@@ -728,14 +728,18 @@ def _in_budget_choice_keyboard(prefix):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🍽 داخل بودجه (خوراک/هزینه اصلی)", callback_data=f"exp:{prefix}:1")],
         [InlineKeyboardButton("📎 هزینه جانبی (قبض و غیره — فقط تو گزارش)", callback_data=f"exp:{prefix}:0")],
+        [InlineKeyboardButton("🚫 لغو (ثبت نکن)", callback_data="exp:cancel")],
     ])
 
 
 async def _register_expense(update, context, household_id, text, source="manual"):
+    # update.message خالیه اگه این تابع از دل یه callback (دکمه) صدا زده شده باشه (نه یه پیام متنی
+    # مستقیم) — تو اون حالت از پیامِ همون دکمه برای پاسخ استفاده می‌کنیم.
+    message = update.message or update.callback_query.message
     cur = db.get_currency(household_id)
     amount, desc, cat, store, tx_date = categorize.parse_free_text_expense_detailed(text, household_id)
     if amount is None:
-        await update.message.reply_text(
+        await message.reply_text(
             "متوجه مبلغ نشدم. مثال: نان 50000  یا  نان 50000 فروشگاه رفاه تاریخ 2026-07-10"
         )
         return None
@@ -749,7 +753,7 @@ async def _register_expense(update, context, household_id, text, source="manual"
     if tx_date:
         extra.append(f"تاریخ: {tx_date}")
     extra_str = (" — " + " — ".join(extra)) if extra else ""
-    await update.message.reply_text(
+    await message.reply_text(
         f"هزینه: {fmt(amount, cur)} — {desc or '—'} (دسته: {cat}){extra_str}\n"
         "این هزینه جزو بودجه باشه یا هزینه جانبیه (مثل قبض) که فقط تو گزارش میاد؟",
         reply_markup=_in_budget_choice_keyboard("quickbudget"),
@@ -848,7 +852,14 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split(":")  # exp:action[:sub]
     action = parts[1] if len(parts) > 1 else ""
 
-    if action == "quickinfo":
+    if action == "cancel":
+        context.chat_data.pop("quick_expense_draft", None)
+        context.chat_data.pop("expense_draft", None)
+        context.chat_data.pop("awaiting", None)
+        await query.edit_message_text("🚫 لغو شد. این هزینه ثبت نشد.")
+        await query.message.reply_text("منوی اصلی 👇", reply_markup=MAIN_MENU_KEYBOARD)
+
+    elif action == "quickinfo":
         await query.edit_message_text(
             "بنویس: مبلغ و توضیح، مثلاً: نان 50000\n"
             "اگه بخوای فروشگاه/تاریخ هم بگی: نان 50000 فروشگاه رفاه تاریخ 2026-07-10"
@@ -1343,6 +1354,17 @@ async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not item:
         return
     db.mark_item_bought(item_id, bought=not item["bought"])
+
+    items_after = db.get_list_items(list_id)
+    if items_after and all(i["bought"] for i in items_after):
+        # همه آیتم‌های لیست تیک خوردن — دیگه لازم نیست فعال بمونه، می‌بندیمش (آرشیو می‌شه، پاک نمی‌شه)
+        db.close_list(list_id)
+        await query.edit_message_text(
+            "🎉 همه آیتم‌های این لیست خریده شدن! لیست بسته شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")]]),
+        )
+        return
+
     text, keyboard = _list_status_text(list_id)
     await query.edit_message_text(text, reply_markup=keyboard)
 
@@ -1968,6 +1990,31 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "هر آیتم رو تو یک خط بفرست. وقتی تموم شد، /donelist رو بزن."
         )
 
+    elif action == "pending" and len(parts) > 2:
+        # پاسخ به سوال «این چند خط، آیتم لیست خریدن یا هزینه؟» (بعد از فرستادن متن چندخطی بدون
+        # اینکه لیست خرید فعالی برای تکمیل باز باشه)
+        pending_text = context.chat_data.pop("pending_multiline_text", None)
+        if not pending_text:
+            await query.edit_message_text("این درخواست منقضی شده. دوباره متن رو بفرست.")
+            return
+        choice = parts[2]
+        if choice == "list":
+            lines = [l for l in pending_text.splitlines() if l.strip()]
+            active = db.get_active_list(household_id)
+            list_id = active["id"] if active else db.create_shopping_list(household_id)
+            context.chat_data["collecting_list_id"] = list_id
+            db.add_list_items(list_id, lines)
+            await query.edit_message_text(
+                f"➕ {len(lines)} آیتم به لیست خرید اضافه شد.\n"
+                "بازم می‌تونی آیتم بفرستی، یا /donelist بزن وقتی تموم شد."
+            )
+        elif choice == "expense":
+            await query.edit_message_text("باشه، به‌عنوان هزینه بررسیش می‌کنم…")
+            await _register_expense(update, context, household_id, pending_text, source="manual")
+        else:  # cancel
+            await query.edit_message_text("🚫 بی‌خیال شدیم، چیزی ثبت نشد.")
+            await query.message.reply_text("منوی اصلی 👇", reply_markup=MAIN_MENU_KEYBOARD)
+
     elif action == "list" and len(parts) > 3 and parts[2] == "additems":
         list_id = int(parts[3])
         context.chat_data["collecting_list_id"] = list_id
@@ -2211,6 +2258,24 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         await _ask_expense_category(update, context, household_id, via_callback=False)
         return
 
+    # حالت ۳.۵: چند خط فرستاده ولی لیست خرید فعالی برای تکمیل باز نکرده — احتمالاً می‌خواسته
+    # آیتم لیست خرید وارد کنه (بدون اینکه اول روی «🛒 لیست خرید» / /newlist بزنه) و اگه همینجوری
+    # به‌عنوان هزینه امتحانش کنیم، ممکنه یه عدد تصادفی تو اسم یکی از آیتم‌ها (مثلاً «شیر ۲ لیتر»)
+    # اشتباهی به‌عنوان مبلغ برداشت بشه. به‌جای حدس زدن، ازش می‌پرسیم منظورش چی بوده.
+    multiline = [l for l in text.splitlines() if l.strip()]
+    if len(multiline) > 1:
+        context.chat_data["pending_multiline_text"] = text
+        await update.message.reply_text(
+            "چند خط فرستادی. اینا آیتم برای لیست خریدن یا می‌خوای یکی‌شون به‌عنوان هزینه ثبت بشه؟\n"
+            "(لیست خرید فعالی برای تکمیل باز نبود، برای همین مطمئن نشدم خودم.)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛒 اینا آیتم لیست خریدن", callback_data="m:pending:list")],
+                [InlineKeyboardButton("💰 نه، به‌عنوان هزینه ثبت کن", callback_data="m:pending:expense")],
+                [InlineKeyboardButton("🚫 هیچکدوم، بی‌خیال", callback_data="m:pending:cancel")],
+            ]),
+        )
+        return
+
     # حالت ۴ (پیش‌فرض): پیام را به‌عنوان هزینه ثبت کن
     await _register_expense(update, context, household_id, text, source="manual")
 
@@ -2325,7 +2390,8 @@ async def _finalize_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             for it in remaining:
                 reply_lines.append(f"  ◻️ {it['item_name']}")
         else:
-            reply_lines.append("\n🎉 کل لیست خرید تکمیل شد!")
+            db.close_list(active["id"])
+            reply_lines.append("\n🎉 کل لیست خرید تکمیل شد! لیست بسته شد.")
 
     bal = db.get_balance(household_id)
     reply_lines.append(f"\n💰 باقیمانده بودجه {_period_label(household_id)}: {fmt(bal['remaining'], cur)}")
