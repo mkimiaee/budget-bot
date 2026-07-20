@@ -794,9 +794,24 @@ def _report_period_bounds(household_id, period):
     return today.replace(day=1).isoformat(), today.isoformat()
 
 
-def get_category_totals(household_id, period):
-    """جمع هزینه‌های داخل بودجه (in_budget=1) به تفکیک دسته، برای یک بازه گزارش — برای نمودار."""
-    start, end = _report_period_bounds(household_id, period)
+def _parse_iso_date(s):
+    return date.fromisoformat(s) if isinstance(s, str) else s
+
+
+def validate_report_date_range(start, end):
+    """start/end را (رشته YYYY-MM-DD یا date) اعتبارسنجی می‌کند. اگه معتبر و start<=end باشه
+    (start, end) رو به‌صورت رشته ISO برمی‌گردونه؛ وگرنه None."""
+    try:
+        s, e = _parse_iso_date(start), _parse_iso_date(end)
+    except (ValueError, TypeError):
+        return None
+    if s > e:
+        return None
+    return s.isoformat(), e.isoformat()
+
+
+def get_category_totals_by_dates(household_id, start, end):
+    """مثل get_category_totals ولی برای یک بازه تاریخ دلخواه (start/end رشته YYYY-MM-DD، شامل هر دو سر)."""
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT COALESCE(category, 'متفرقه') as category, SUM(amount) as total FROM transactions
@@ -807,13 +822,28 @@ def get_category_totals(household_id, period):
         return [{"category": r["category"], "total": r["total"]} for r in rows]
 
 
+def get_category_totals(household_id, period):
+    """جمع هزینه‌های داخل بودجه (in_budget=1) به تفکیک دسته، برای یک بازه گزارش — برای نمودار."""
+    start, end = _report_period_bounds(household_id, period)
+    return get_category_totals_by_dates(household_id, start, end)
+
+
 def get_report(household_id, period):
     """
-    گزارش ساده: هر فاکتور (همه ردیف‌های یک عکس/PDF که receipt_id مشترک دارند) یک ردیف واحد
-    می‌شود (با جمع مبلغش)، و هر هزینه دستی هم یک ردیف جدا؛ فقط تاریخ، یک برچسب کوتاه، و مبلغ —
-    بدون جزئیات ردیف‌به‌ردیف فاکتور. به‌علاوه جمع کل بازه و جمع امروز.
+    گزارش ساده برای یکی از بازه‌های آماده ('day'|'week'|'month'|'period'). برای بازه دلخواه از
+    get_report_by_dates استفاده کن.
     """
     start, end = _report_period_bounds(household_id, period)
+    return get_report_by_dates(household_id, start, end)
+
+
+def get_report_by_dates(household_id, start, end):
+    """
+    گزارش ساده برای یک بازه تاریخ دلخواه (start/end رشته YYYY-MM-DD، شامل هر دو سر بازه):
+    هر فاکتور (همه ردیف‌های یک عکس/PDF که receipt_id مشترک دارند) یک ردیف واحد می‌شود (با جمع
+    مبلغش)، و هر هزینه دستی هم یک ردیف جدا؛ فقط تاریخ، یک برچسب کوتاه، و مبلغ — بدون جزئیات
+    ردیف‌به‌ردیف فاکتور. به‌علاوه جمع کل بازه، جمع درآمد بازه، و جمع امروز.
+    """
     today = date.today()
 
     with get_conn() as conn:

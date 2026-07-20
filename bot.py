@@ -46,6 +46,12 @@ try:
 except ImportError:
     CHART_AVAILABLE = False
 
+try:
+    import pdf_report
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("budget-bot")
 
@@ -163,6 +169,16 @@ def _report_period_keyboard():
             InlineKeyboardButton("📈 این هفته", callback_data="m:chart:week"),
             InlineKeyboardButton("📈 این ماه", callback_data="m:chart:month"),
         ],
+        [
+            InlineKeyboardButton("📅 بازه دلخواه", callback_data="m:report:custom"),
+        ],
+    ])
+
+
+def _report_pdf_keyboard(pdf_callback_data):
+    """کیبورد زیر یه گزارش متنی: دکمه گرفتن همون گزارش به‌صورت PDF."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 دریافت PDF این گزارش", callback_data=pdf_callback_data)],
     ])
 
 
@@ -219,6 +235,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/balance — باقیمانده بودجه\n"
         "/recalc — محاسبه مجدد بودجه و هزینه‌ها از صفر (برای اطمینان از درستی عددها)\n"
         "/report day|week|month — لیست هزینه‌ها (تاریخ و مبلغ) و جمع بازه\n"
+        "/report <از تاریخ> <تا تاریخ> — گزارش برای یک بازه دلخواه (مثلاً /report 2026-06-01 2026-06-30)؛ "
+        "از منوی 📊 گزارش هم می‌تونی «📅 بازه دلخواه» رو بزنی. زیر هر گزارش دکمه دریافت PDF هم هست.\n"
         "/chart day|week|month — نمودار دایره‌ای هزینه‌ها بر اساس دسته\n"
         "/transactions — نمایش تراکنش‌های اخیر برای حذف یا ویرایش\n"
         "/undo — برگردوندن آخرین تراکنش ثبت‌شده (هزینه یا درآمد)\n"
@@ -980,44 +998,84 @@ def _render_report_groups(groups, cur, period):
     return lines
 
 
-def _report_text(household_id, period):
-    """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
-    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز).
+def _report_text_core(r, cur, title, show_date_headers):
+    """رندر متنی مشترک بین گزارش بازه‌های آماده (روز/هفته/ماه) و گزارش بازه دلخواه.
     هزینه‌های جانبی (قبض و غیره) کاملاً از هزینه‌های داخل بودجه جدا می‌شن و بعد از جمع‌بندی
     هزینه‌های اصلی، تو یه بخش مجزا با عنوان و آیکن خودشون لیست می‌شن."""
-    cur = db.get_currency(household_id)
-    period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
-    period = period_map.get(period, "month")
-    r = db.get_report(household_id, period)
-    title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
     if not r["groups"]:
         return f"هیچ هزینه‌ای برای {title} ثبت نشده."
 
     budget_groups = [g for g in r["groups"] if g.get("in_budget", 1)]
     side_groups = [g for g in r["groups"] if not g.get("in_budget", 1)]
+    render_kind = "week" if show_date_headers else "day"
 
     lines = [f"🧾 لیست هزینه‌ها — {title}\n"]
     if budget_groups:
-        lines.extend(_render_report_groups(budget_groups, cur, period))
+        lines.extend(_render_report_groups(budget_groups, cur, render_kind))
     else:
         lines.append("(هزینه‌ای داخل بودجه ثبت نشده)")
 
     lines.append(f"\nجمع {title} (داخل بودجه): {fmt(r['total'], cur)}")
-    if period != "day":
+    if show_date_headers:
         lines.append(f"هزینه امروز: {fmt(r['today_total'], cur)}")
 
     if side_groups:
         lines.append("\n📎 هزینه‌های جانبی (خارج از بودجه)")
-        lines.extend(_render_report_groups(side_groups, cur, period))
+        lines.extend(_render_report_groups(side_groups, cur, render_kind))
         lines.append(f"\nجمع هزینه‌های جانبی: {fmt(r['side_total'], cur)}")
 
     return "\n".join(lines)
 
 
+def _report_text(household_id, period):
+    """گزارش ساده: هر فاکتور/هزینه یک ردیف شماره‌دار (تاریخ، برچسب کوتاه، مبلغ) — بدون جزئیات
+    ردیف‌به‌ردیف فاکتور و بدون درصد — به‌علاوه جمع بازه (و جمع امروز)."""
+    cur = db.get_currency(household_id)
+    period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
+    period = period_map.get(period, "month")
+    r = db.get_report(household_id, period)
+    title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+    return _report_text_core(r, cur, title, show_date_headers=(period != "day"))
+
+
+def _report_title_for_range(start, end):
+    return start if start == end else f"{start} تا {end}"
+
+
+def _report_text_range(household_id, start, end):
+    """مثل _report_text ولی برای یک بازه تاریخ دلخواه (start/end رشته YYYY-MM-DD)."""
+    cur = db.get_currency(household_id)
+    r = db.get_report_by_dates(household_id, start, end)
+    title = _report_title_for_range(start, end)
+    return _report_text_core(r, cur, title, show_date_headers=True)
+
+
 @require_household
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    if len(context.args) >= 2:
+        start = categorize.parse_simple_date(context.args[0])
+        end = categorize.parse_simple_date(context.args[1])
+        rng = db.validate_report_date_range(start, end) if (start and end) else None
+        if not rng:
+            await update.message.reply_text(
+                "بازه تاریخ نامعتبره. فرمت درست: /report <از تاریخ> <تا تاریخ>\n"
+                "مثال: /report 2026-06-01 2026-06-30"
+            )
+            return
+        start, end = rng
+        await update.message.reply_text(
+            _report_text_range(household_id, start, end),
+            reply_markup=_report_pdf_keyboard(f"m:reportpdf:custom:{start}:{end}"),
+        )
+        return
+
     period = context.args[0] if context.args else "month"
-    await update.message.reply_text(_report_text(household_id, period))
+    period_map = {"day": "day", "روز": "day", "week": "week", "هفته": "week", "month": "month", "ماه": "month"}
+    period = period_map.get(period, "month")
+    await update.message.reply_text(
+        _report_text(household_id, period),
+        reply_markup=_report_pdf_keyboard(f"m:reportpdf:{period}"),
+    )
 
 
 def _generate_category_pie_chart(rows):
@@ -1770,9 +1828,47 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chart_buf = _generate_category_pie_chart(rows)
         await query.message.reply_photo(photo=chart_buf, caption="\n".join(caption_lines))
 
+    elif action == "report" and len(parts) > 2 and parts[2] == "custom":
+        context.chat_data["awaiting"] = "report_range_start"
+        await query.edit_message_text(
+            "بازه‌ی گزارش رو با دو تا پیام بهم بگو.\n"
+            "اول تاریخ شروع رو بفرست (میلادی، مثلاً 2026-06-01):"
+        )
+
     elif action == "report" and len(parts) > 2:
         period = parts[2]
-        await query.edit_message_text(_report_text(household_id, period), reply_markup=_report_period_keyboard())
+        await query.edit_message_text(
+            _report_text(household_id, period),
+            reply_markup=_report_pdf_keyboard(f"m:reportpdf:{period}"),
+        )
+
+    elif action == "reportpdf" and len(parts) > 2:
+        if not PDF_AVAILABLE:
+            await query.answer("ساخت PDF روی این سرور فعال نیست.", show_alert=True)
+            return
+        if parts[2] == "custom" and len(parts) > 4:
+            start, end = parts[3], parts[4]
+            title = _report_title_for_range(start, end)
+            r = db.get_report_by_dates(household_id, start, end)
+        else:
+            period = parts[2]
+            title = {"day": "امروز", "week": "این هفته", "month": "این ماه"}[period]
+            r = db.get_report(household_id, period)
+        cur = db.get_currency(household_id)
+        if not r["groups"]:
+            await query.answer(f"هزینه‌ای برای {title} ثبت نشده که PDF بسازم.", show_alert=True)
+            return
+        await query.answer("در حال ساخت PDF…")
+        try:
+            pdf_buf = pdf_report.build_report_pdf(title, r, cur)
+        except Exception:
+            logger.exception("Failed to build report PDF")
+            await query.message.reply_text("ساخت فایل PDF با خطا مواجه شد. دوباره امتحان کن.")
+            return
+        await query.message.reply_document(
+            document=pdf_buf, filename=f"gozaresh-{title.replace(' ', '_')}.pdf",
+            caption=f"🧾 گزارش هزینه‌ها — {title}",
+        )
 
     elif action == "list" and len(parts) > 2 and parts[2] == "new":
         list_id = db.create_shopping_list(household_id)
@@ -1938,6 +2034,38 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         prompt = _budget_followup_prompt(household_id, context)
         await update.message.reply_text(
             f"✅ بازه بودجه روی «هفتگی» تنظیم شد؛ هر هفته از روز {day_name} شروع می‌شه.\n\n{prompt}"
+        )
+        return
+    if awaiting == "report_range_start":
+        start = categorize.parse_simple_date(text)
+        if not start:
+            await update.message.reply_text(
+                "متوجه نشدم. یه تاریخ میلادی بفرست، مثلاً 2026-06-01."
+            )
+            context.chat_data["awaiting"] = "report_range_start"
+            return
+        context.chat_data["report_range_start"] = start
+        context.chat_data["awaiting"] = "report_range_end"
+        await update.message.reply_text(f"باشه، از {start}. حالا تاریخ پایان بازه رو بفرست:")
+        return
+    if awaiting == "report_range_end":
+        start = context.chat_data.pop("report_range_start", None)
+        end = categorize.parse_simple_date(text)
+        if not start:
+            await update.message.reply_text("این فرآیند منقضی شده. دوباره از منوی 📊 گزارش شروع کن.")
+            return
+        rng = db.validate_report_date_range(start, end) if end else None
+        if not rng:
+            await update.message.reply_text(
+                "این تاریخ نامعتبره یا قبل از تاریخ شروعه. یه تاریخ میلادی معتبر بفرست، مثلاً 2026-06-30."
+            )
+            context.chat_data["report_range_start"] = start
+            context.chat_data["awaiting"] = "report_range_end"
+            return
+        start, end = rng
+        await update.message.reply_text(
+            _report_text_range(household_id, start, end),
+            reply_markup=_report_pdf_keyboard(f"m:reportpdf:custom:{start}:{end}"),
         )
         return
     if awaiting == "edit_tx_amount":
