@@ -1295,18 +1295,16 @@ async def donelist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, house
     items = db.get_list_items(list_id)
     await update.message.reply_text(
         f"✅ لیست با {len(items)} آیتم ثبت شد.\n"
-        "هر وقت خرید کردی، عکس فاکتور رو بفرست یا با /list آیتم‌ها رو دستی تیک بزن."
+        "هر وقت خرید کردی، عکس فاکتور رو بفرست (خودکار حذف می‌شن) یا با /list هرکدوم رو که خریدی دستی بزن تا حذف بشه."
     )
 
 
 def _list_keyboard(list_id, items):
     buttons = []
     for it in items:
-        mark = "✅" if it["bought"] else "◻️"
-        buttons.append([
-            InlineKeyboardButton(f"{mark} {it['item_name']}", callback_data=f"toggle:{list_id}:{it['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"delitem:{list_id}:{it['id']}"),
-        ])
+        # روی خودِ اسم آیتم بزنی، همون لحظه از لیست حذف می‌شه (یعنی خریدیش) — دیگه دکمه جدا برای
+        # تیک‌زدن/حذف نداریم، یه تپ کافیه.
+        buttons.append([InlineKeyboardButton(f"◻️ {it['item_name']}", callback_data=f"delitem:{list_id}:{it['id']}")])
     buttons.append([InlineKeyboardButton("➕ افزودن آیتم", callback_data=f"m:list:additems:{list_id}")])
     buttons.append([InlineKeyboardButton("🗑 حذف کل لیست", callback_data=f"m:list:delall:{list_id}")])
     buttons.append([InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")])
@@ -1326,8 +1324,7 @@ def _list_status_text(list_id):
             [InlineKeyboardButton("➕ لیست جدید", callback_data="m:list:new")],
         ])
         return text, keyboard
-    remaining = [i for i in items if not i["bought"]]
-    text = f"🛒 {name} — {len(remaining)} مورد باقی‌مانده از {len(items)}\nروی هرکدوم بزن تا وضعیتش عوض بشه:"
+    text = f"🛒 {name} — {len(items)} مورد باقی‌مانده\nهر آیتمی رو که خریدی بزن تا از لیست حذف بشه:"
     return text, _list_keyboard(list_id, items)
 
 
@@ -1344,20 +1341,18 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household
     await update.message.reply_text(text, reply_markup=keyboard)
 
 
-async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delitem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """با زدن روی اسم یه آیتم تو لیست خرید صدا زده می‌شه — یعنی خریدیش، همون لحظه از لیست حذف
+    می‌شه. اگه با این حذف، لیست کاملاً خالی بشه (همه آیتم‌ها خریده شدن)، خودِ لیست هم بسته می‌شه
+    (آرشیو می‌شه، پاک نمی‌شه) تا لیست کامل‌شده الکی فعال نمونه."""
     query = update.callback_query
-    await query.answer()
     _, list_id, item_id = query.data.split(":")
     list_id, item_id = int(list_id), int(item_id)
-    items = db.get_list_items(list_id)
-    item = next((i for i in items if i["id"] == item_id), None)
-    if not item:
-        return
-    db.mark_item_bought(item_id, bought=not item["bought"])
+    db.delete_list_item(item_id)
+    await query.answer("✅ حذف شد")
 
     items_after = db.get_list_items(list_id)
-    if items_after and all(i["bought"] for i in items_after):
-        # همه آیتم‌های لیست تیک خوردن — دیگه لازم نیست فعال بمونه، می‌بندیمش (آرشیو می‌شه، پاک نمی‌شه)
+    if not items_after:
         db.close_list(list_id)
         await query.edit_message_text(
             "🎉 همه آیتم‌های این لیست خریده شدن! لیست بسته شد.",
@@ -1365,17 +1360,6 @@ async def toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text, keyboard = _list_status_text(list_id)
-    await query.edit_message_text(text, reply_markup=keyboard)
-
-
-async def delitem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حذف یک آیتم مشخص از لیست خرید (دکمه 🗑 کنار هر آیتم)."""
-    query = update.callback_query
-    await query.answer("آیتم حذف شد")
-    _, list_id, item_id = query.data.split(":")
-    list_id, item_id = int(list_id), int(item_id)
-    db.delete_list_item(item_id)
     text, keyboard = _list_status_text(list_id)
     await query.edit_message_text(text, reply_markup=keyboard)
 
@@ -2380,16 +2364,17 @@ async def _finalize_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         items = db.get_list_items(active["id"])
         matches, unmatched = ocr.match_against_list(lines, items)
         for m in matches:
-            db.mark_item_bought(m["list_item"]["id"], bought=True, price=m["receipt_line"]["amount"])
-        items_after = db.get_list_items(active["id"])
-        remaining = [i for i in items_after if not i["bought"]]
+            # آیتم تطبیق‌خورده با فاکتور یعنی خریداری شده — از لیست حذف می‌شه (نه فقط تیک بخوره)
+            db.delete_list_item(m["list_item"]["id"])
+        remaining = db.get_list_items(active["id"])
         if matches:
-            reply_lines.append(f"\n✅ {len(matches)} مورد از لیست خریدت به‌صورت خودکار تیک خورد.")
+            reply_lines.append(f"\n✅ {len(matches)} مورد از لیست خریدت به‌صورت خودکار حذف شد (خریداری شد).")
         if remaining:
             reply_lines.append("\n🛒 هنوز باقی مونده از لیست:")
             for it in remaining:
                 reply_lines.append(f"  ◻️ {it['item_name']}")
-        else:
+        elif items:
+            # فقط وقتی لیست واقعاً آیتم داشته و همه‌شون الان حذف شدن، به‌عنوان «تکمیل شد» اعلام کن
             db.close_list(active["id"])
             reply_lines.append("\n🎉 کل لیست خرید تکمیل شد! لیست بسته شد.")
 
@@ -2725,7 +2710,6 @@ def main():
     app.add_handler(CommandHandler("donelist", donelist_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
 
-    app.add_handler(CallbackQueryHandler(toggle_callback, pattern=r"^toggle:"))
     app.add_handler(CallbackQueryHandler(delitem_callback, pattern=r"^delitem:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(tx_callback, pattern=r"^tx:"))
