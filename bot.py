@@ -8,6 +8,7 @@ import os
 import shutil
 import uuid
 from datetime import date, time as dt_time, timedelta
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv
@@ -2727,12 +2728,17 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
 
     if app.job_queue:
-        # هر روز ساعت ۲۱:۰۰ (به وقت سرور) چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
+        # نکته مهم: JobQueue اگه tzinfo رو صریح روی خودِ datetime.time ندیم، پیش‌فرض UTC حساب می‌کنه
+        # (نه وقت سرور، نه وقت خانواده) — چون نه سرور TZ ست داره و نه اینجا Defaults(tzinfo=...) دادیم.
+        # برای همینه ساعت‌های ۱۳/۲۲ قبلاً شیفت‌خورده (با تاخیر ~۲ ساعت به وقت اسپانیا) اجرا می‌شدن.
+        # اینجا صریحاً وقت محلی خانواده (اسپانیا) رو می‌ذاریم تا واقعاً همون ساعتِ گفته‌شده اجرا بشه.
+        LOCAL_TZ = ZoneInfo("Europe/Madrid")
+        # هر روز ساعت ۲۱:۰۰ به وقت اسپانیا چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
         # بازه بودجه‌شونه واقعاً پیام می‌فرسته
-        app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0))
-        # روزی دو بار (۱۳:۰۰ و ۲۲:۰۰ به وقت سرور) چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
-        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=13, minute=0))
-        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=22, minute=0))
+        app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0, tzinfo=LOCAL_TZ))
+        # روزی دو بار (۱۳:۰۰ و ۲۲:۰۰ به وقت اسپانیا) چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=13, minute=0, tzinfo=LOCAL_TZ))
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=22, minute=0, tzinfo=LOCAL_TZ))
     else:
         logger.warning(
             "JobQueue در دسترس نیست (پکیج python-telegram-bot[job-queue] نصب نشده)؛ "
