@@ -134,6 +134,20 @@ def _has_letter(text: str) -> bool:
     return re.search(r"[^\W\d_]", text, re.UNICODE) is not None
 
 
+def _matches_keyword(line_lower: str, keywords) -> bool:
+    """
+    مطابقت هر کلمه‌کلیدی را به‌صورت «کلمه‌ی کامل» بررسی می‌کند، نه زیررشته‌ی دلخواه.
+    اگر فقط با `in` چک می‌شد، کلمات کوتاهی مثل «tel» یا «iva» به‌اشتباه *داخل* کلمات کاملاً
+    بی‌ربط دیگه هم پیدا می‌شدن — مثلاً «tel» داخل «BOTELLA» یا «iva» داخل «OLIVA» —
+    و باعث می‌شد یک ردیف کالای واقعی به‌غلط «جمع کل/سربرگ» تشخیص داده بشه و کل فاکتور
+    از همون ردیف به بعد قطع بشه (دقیقاً همون باگی که فقط اولین آیتم فاکتور مرکادونا رو می‌خوند).
+    """
+    for kw in keywords:
+        if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", line_lower):
+            return True
+    return False
+
+
 # اگر یکی از این‌ها به‌عنوان تیتر ستون‌های کالا در فاکتور دیده بشه، یعنی از این خط به بعد لیست کالاهاست
 # و هر چی قبلش بوده (نام فروشگاه، آدرس، تلفن، شناسه مالیاتی و...) قطعاً هدر است، نه کالا.
 # این کمک می‌کنه اعداد بزرگ تو سربرگ (مثل شناسه مالیاتی یا کدپستی) اشتباهی به‌عنوان قیمت خونده نشن.
@@ -155,7 +169,7 @@ def parse_receipt_lines(raw_text: str):
     raw_lines = raw_text.splitlines()
     start_idx = 0
     for i, raw_line in enumerate(raw_lines):
-        if any(h in normalize_text(raw_line).lower() for h in HEADER_START_KEYWORDS):
+        if _matches_keyword(normalize_text(raw_line).lower(), HEADER_START_KEYWORDS):
             start_idx = i + 1
             break
 
@@ -165,7 +179,7 @@ def parse_receipt_lines(raw_text: str):
         if not line or len(line) < 2:
             continue
         line_lower = line.lower()
-        if any(kw in line_lower for kw in NON_ITEM_KEYWORDS):
+        if _matches_keyword(line_lower, NON_ITEM_KEYWORDS):
             continue
 
         amount, name, is_decimal = extract_amount_detailed(line)
@@ -205,7 +219,7 @@ def parse_receipt_lines_columnar(text: str):
 
     start_idx = 0
     for i, l in enumerate(raw_lines):
-        if any(h in l.lower() for h in HEADER_START_KEYWORDS):
+        if _matches_keyword(l.lower(), HEADER_START_KEYWORDS):
             start_idx = i + 1
             break
 
@@ -215,7 +229,7 @@ def parse_receipt_lines_columnar(text: str):
 
     for line in raw_lines[start_idx:]:
         line_lower = line.lower()
-        if any(kw in line_lower for kw in NON_ITEM_KEYWORDS):
+        if _matches_keyword(line_lower, NON_ITEM_KEYWORDS):
             # اگر هنوز به هیچ کالایی نرسیده‌ایم، این یک تکه از سربرگ/ستون‌عنوان باقی‌مانده است؛ ردش کن.
             # اگر قبلاً کالا جمع کرده‌ایم، یعنی به بخش جمع‌کل/پرداخت رسیده‌ایم؛ دیگه کالایی نیست.
             if items or (current_name and current_amount is not None):
