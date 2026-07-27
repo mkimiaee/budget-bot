@@ -9,6 +9,7 @@ import string
 from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 from collections import Counter
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DB_PATH = os.environ.get("BOT_DB_PATH", os.path.join(os.path.dirname(__file__), "data", "bot.db"))
 # اگه BOT_DB_PATH به یه پوشه اشاره کنه (نه فایل دیتابیس) — مثلاً روی Railway که یه Volume مستقیم
@@ -20,6 +21,15 @@ if os.path.isdir(DB_PATH):
 # واحد پول پیش‌فرض برای خانواده‌های جدید؛ با متغیر محیطی DEFAULT_CURRENCY قابل تنظیم است.
 # هر خانواده بعداً می‌تواند با دستور /currency آن را برای خودش عوض کند.
 DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "€")
+
+# منطقه زمانی پیش‌فرض برای خانواده‌های جدید؛ با متغیر محیطی DEFAULT_TIMEZONE قابل تنظیم است.
+# هر خانواده بعداً می‌تواند با دستور /timezone آن را برای خودش عوض کند.
+# نکته مهم: سرور (Railway/Docker) معمولاً به وقت UTC تنظیم شده، نه وقت واقعی خانواده. اگر برای
+# محاسبه‌ی «امروز» به‌جای این تابع مستقیماً از date.today()/datetime.now() استفاده کنیم، نزدیک نیمه‌شب
+# به وقت محلی خانواده (وقتی هنوز به وقت UTC روز قبل حساب می‌شه) بازه‌ی بودجه با یک روز تأخیر عوض
+# می‌شه — دقیقاً همون باگی که باعث می‌شد شب دوشنبه هنوز «۱ روز تا پایان هفته» نشون بده و بودجه‌ی
+# بازه‌ی جدید نیاد. برای همین همه‌جا باید از household_today() استفاده کرد، نه date.today() خام.
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/Madrid")
 
 CURRENCY_PRESETS = {
     "toman": "تومان", "تومان": "تومان",
@@ -44,6 +54,7 @@ CREATE TABLE IF NOT EXISTS households (
     currency TEXT DEFAULT 'تومان',
     budget_period TEXT DEFAULT 'monthly',      -- 'monthly' | 'weekly'
     week_start_weekday INTEGER,                -- 0=دوشنبه .. 6=یکشنبه (فقط وقتی weekly است)
+    timezone TEXT DEFAULT 'Europe/Madrid',     -- منطقه زمانی خانواده (مثل Europe/Madrid) — برای محاسبه‌ی «امروز»
     owner_id INTEGER,                          -- telegram_id کسی که خانواده رو ساخته؛ فقط همون کد دعوت رو می‌بینه
     created_at TEXT NOT NULL
 );
@@ -194,6 +205,9 @@ def init_db():
             conn.execute("ALTER TABLE households ADD COLUMN budget_period TEXT DEFAULT 'monthly'")
         if "week_start_weekday" not in cols:
             conn.execute("ALTER TABLE households ADD COLUMN week_start_weekday INTEGER")
+        if "timezone" not in cols:
+            conn.execute(f"ALTER TABLE households ADD COLUMN timezone TEXT DEFAULT '{DEFAULT_TIMEZONE}'")
+            conn.execute("UPDATE households SET timezone=? WHERE timezone IS NULL", (DEFAULT_TIMEZONE,))
         if "owner_id" not in cols:
             conn.execute("ALTER TABLE households ADD COLUMN owner_id INTEGER")
             # برای خانواده‌های قدیمی‌تر که owner_id ندارن، قدیمی‌ترین عضو رو مالک در نظر می‌گیریم
@@ -339,6 +353,40 @@ def set_currency(household_id, currency_input):
     return normalized
 
 
+# ---------- منطقه زمانی خانواده ----------
+
+def get_timezone(household_id):
+    """نام منطقه زمانی خانواده (مثل 'Europe/Madrid') را برمی‌گرداند؛ اگر ثبت نشده باشد، پیش‌فرض."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT timezone FROM households WHERE id=?", (household_id,)).fetchone()
+        return (row["timezone"] if row and row["timezone"] else DEFAULT_TIMEZONE)
+
+
+def set_timezone(household_id, tz_name):
+    """منطقه زمانی خانواده را تنظیم می‌کند. اگر نام معتبر نباشد ValueError می‌دهد (تا دستور بات بتواند
+    پیام خطای مناسب نشان دهد) بدون این‌که چیزی در دیتابیس خراب شود."""
+    tz_name = tz_name.strip()
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise ValueError(f"منطقه زمانی نامعتبر: {tz_name}")
+    with get_conn() as conn:
+        conn.execute("UPDATE households SET timezone=? WHERE id=?", (tz_name, household_id))
+    return tz_name
+
+
+def household_today(household_id):
+    """تاریخ «امروز» را به وقت محلی خانواده (نه ساعت سرور) برمی‌گرداند. همه‌ی محاسبات مربوط به بازه‌ی
+    بودجه (شروع/پایان هفته یا ماه، روزهای باقی‌مانده و غیره) باید از این تابع استفاده کنند، نه
+    date.today() خام — چون date.today() به وقت سرور حساب می‌شه که معمولاً UTC است، نه وقت خانواده."""
+    tz_name = get_timezone(household_id)
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    return datetime.now(tz).date()
+
+
 # ---------- بازه بودجه (ماهانه یا هفتگی با روز شروع دلخواه) ----------
 
 def get_budget_period(household_id):
@@ -381,7 +429,7 @@ def get_current_period_bounds(household_id, ref_date=None):
     بازه بودجه جاری خانواده را برمی‌گرداند: (تاریخ شروع, تاریخ پایان, کلید یکتای بازه, نوع بازه)
     برای بازه هفتگی، هفته از نزدیک‌ترین روز هفته‌ی انتخاب‌شده (که <= امروز است) شروع می‌شود.
     """
-    ref_date = ref_date or date.today()
+    ref_date = ref_date or household_today(household_id)
     period = get_budget_period(household_id)
     if period["period_type"] == "weekly":
         wd = period["week_start_weekday"] if period["week_start_weekday"] is not None else 0
@@ -629,7 +677,7 @@ def delete_recurring_bill(household_id, bill_id):
 
 def add_transaction(household_id, user_id, tx_type, amount, category=None, description=None,
                      source="manual", tx_date=None, store=None, receipt_id=None, in_budget=1):
-    tx_date = tx_date or date.today().isoformat()
+    tx_date = tx_date or household_today(household_id).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO transactions
@@ -750,7 +798,7 @@ def _sum(conn, household_id, tx_type, start, end, in_budget_only=False):
 def get_balance(household_id):
     """بودجه بازه جاری (ماهانه یا هفتگیِ تنظیم‌شده) منهای هزینه‌ها به‌علاوه درآمدهای همان بازه.
     هزینه‌های جانبی (in_budget=0، مثل قبض) اینجا حساب نمی‌شن؛ فقط تو گزارش دیده می‌شن."""
-    today = date.today()
+    today = household_today(household_id)
     start, end, period_key, period_type = get_current_period_bounds(household_id, today)
 
     budget = get_budget(household_id) or 0.0
@@ -783,7 +831,7 @@ def _report_period_bounds(household_id, period):
     """بازه تاریخ (start, end به‌صورت رشته YYYY-MM-DD) برای یک برچسب گزارش ('day'|'week'|'month'|'period')
     را برمی‌گرداند. برای 'week' از همان روز شروع هفته‌ای استفاده می‌شود که در تنظیمات بازه بودجه انتخاب
     شده (week_start_weekday)، تا جمع گزارش هفتگی همیشه با محاسبه /balance یکی باشد."""
-    today = date.today()
+    today = household_today(household_id)
     if period in ("day", "روز"):
         return today.isoformat(), today.isoformat()
     if period in ("week", "هفته"):
@@ -810,7 +858,7 @@ def get_recent_periods(household_id, n=4, ref_date=None):
     به جدید، شامل بازه جاری (ناقص اگه هنوز تموم نشده). برای نمایش دکمه‌های انتخاب سریع بازه گزارش
     استفاده می‌شه — به‌جای اینکه کاربر مجبور باشه تاریخ دقیق بازه بودجه‌ش رو حفظ باشه و دستی بزنه.
     خروجی: لیستی از {"start":.., "end":..} (رشته ISO)."""
-    ref_date = ref_date or date.today()
+    ref_date = ref_date or household_today(household_id)
     periods = []
     cursor = ref_date
     for _ in range(n):
@@ -912,7 +960,7 @@ def get_report_by_dates(household_id, start, end):
     مبلغش)، و هر هزینه دستی هم یک ردیف جدا؛ فقط تاریخ، یک برچسب کوتاه، و مبلغ — بدون جزئیات
     ردیف‌به‌ردیف فاکتور. به‌علاوه جمع کل بازه، جمع درآمد بازه، و جمع امروز.
     """
-    today = date.today()
+    today = household_today(household_id)
 
     with get_conn() as conn:
         rows = conn.execute(

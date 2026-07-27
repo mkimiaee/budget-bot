@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import uuid
-from datetime import date, time as dt_time, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
 try:
@@ -112,6 +112,7 @@ def _settings_keyboard():
         [InlineKeyboardButton("💰📅 بودجه و بازه زمانی", callback_data="m:budgetperiod")],
         [InlineKeyboardButton("📁💰 بودجه دسته‌ای", callback_data="m:catbudget")],
         [InlineKeyboardButton("💱 تغییر واحد پول", callback_data="m:currency")],
+        [InlineKeyboardButton("🕒 منطقه زمانی", callback_data="m:timezone")],
         [InlineKeyboardButton("📁 دسته‌بندی‌ها", callback_data="m:categories")],
         [InlineKeyboardButton("🧾 قبض‌های تکرارشونده", callback_data="m:bills")],
         [InlineKeyboardButton("📧 اتصال ایمیل فاکتور (Mercadona)", callback_data="m:emailstatus")],
@@ -260,6 +261,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addcategory <نام> | <کلمات کلیدی> — دسته جدید اضافه کن\n"
         "/delcategory — حذف یکی از دسته‌های اختصاصی خانواده\n"
         "/currency <واحد> — تغییر واحد پول (مثلاً EUR، یورو، تومان، $)\n"
+        "/timezone <منطقه> — دیدن یا تغییر منطقه زمانی خانواده (مثلاً Europe/Madrid یا Asia/Tehran) — "
+        "همینه که تعیین می‌کنه بازه بودجه دقیقاً کِی تموم می‌شه\n"
         "/invite — گرفتن کد دعوت خانواده (فقط ادمین/سازنده خانواده)\n"
         "/members — نمایش اعضای خانواده (ادمین می‌تونه عضو حذف کنه)\n"
         "/join <کد> — پیوستن به خانواده‌ای دیگر\n"
@@ -359,7 +362,7 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, househo
         with open(db.DB_PATH, "rb") as f:
             await update.message.reply_document(
                 document=f,
-                filename=f"budget-bot-backup-{date.today().isoformat()}.db",
+                filename=f"budget-bot-backup-{db.household_today(household_id).isoformat()}.db",
                 caption=(
                     "📦 نسخه پشتیبان کامل دیتابیس. این فایل رو یه جای امن نگه دار.\n"
                     "برای بازگردانی: همین فایل رو به‌جای data/bot.db روی سرور بذار."
@@ -520,6 +523,38 @@ async def currency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, house
     raw = " ".join(context.args)
     new_currency = db.set_currency(household_id, raw)
     await update.message.reply_text(f"✅ واحد پول روی «{new_currency}» تنظیم شد.")
+
+
+@require_household
+async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
+    if not context.args:
+        tz = db.get_timezone(household_id)
+        now_local = datetime.now(ZoneInfo(tz))
+        await update.message.reply_text(
+            f"منطقه زمانی فعلی: {tz}\n"
+            f"ساعت الان به این تایم‌زون: {now_local.strftime('%Y-%m-%d %H:%M')}\n\n"
+            "برای تغییر، یک نام استاندارد IANA بفرست، مثلاً:\n"
+            "/timezone Europe/Madrid\n"
+            "/timezone Asia/Tehran\n"
+            "/timezone Europe/London\n\n"
+            "⚠️ این تنظیم روی محاسبه‌ی «امروز» تأثیر می‌ذاره — یعنی این‌که بازه بودجه (هفتگی/ماهانه) دقیقاً "
+            "کِی تموم می‌شه و روز جدید کِی شروع می‌شه. اگه اشتباه تنظیم بشه، ممکنه نزدیک نیمه‌شب بازه بودجه "
+            "با تأخیر یا تعجیل عوض بشه."
+        )
+        return
+    raw = " ".join(context.args).strip()
+    try:
+        new_tz = db.set_timezone(household_id, raw)
+    except ValueError:
+        await update.message.reply_text(
+            f"«{raw}» یه نام منطقه زمانی معتبر (IANA) نیست. مثال درست: Europe/Madrid یا Asia/Tehran"
+        )
+        return
+    now_local = datetime.now(ZoneInfo(new_tz))
+    await update.message.reply_text(
+        f"✅ منطقه زمانی روی «{new_tz}» تنظیم شد.\n"
+        f"ساعت الان به این تایم‌زون: {now_local.strftime('%Y-%m-%d %H:%M')}"
+    )
 
 
 def _set_budget_and_reply_text(household_id, amount, cur):
@@ -691,7 +726,7 @@ async def bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add_transaction(
             household_id, update.effective_user.id, "expense", bill["amount"],
             category=bill["category"] or "قبض", description=bill["name"],
-            source="manual", tx_date=date.today().isoformat(), in_budget=0,
+            source="manual", tx_date=db.household_today(household_id).isoformat(), in_budget=0,
         )
         await query.edit_message_text(
             f"✅ «{bill['name']}» با مبلغ {fmt(bill['amount'], cur)} به‌عنوان هزینه جانبی امروز ثبت شد.\n"
@@ -811,7 +846,7 @@ async def _commit_expense_draft(update: Update, context: ContextTypes.DEFAULT_TY
     amount = draft.get("amount")
     desc = draft.get("description")
     store = draft.get("store")
-    tx_date = draft.get("tx_date") or date.today().isoformat()
+    tx_date = draft.get("tx_date") or db.household_today(household_id).isoformat()
     cat = draft.get("category") or (categorize.categorize(desc, household_id) if desc else "متفرقه")
     in_budget = draft.get("in_budget", 1)
     user_id = update.effective_user.id
@@ -878,10 +913,10 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("این فرآیند منقضی شده. دوباره از ➖ ثبت هزینه شروع کن.")
             return
         if choice == "today":
-            draft["tx_date"] = date.today().isoformat()
+            draft["tx_date"] = db.household_today(household_id).isoformat()
             await _ask_expense_category(update, context, household_id, via_callback=True)
         elif choice == "yesterday":
-            draft["tx_date"] = (date.today() - timedelta(days=1)).isoformat()
+            draft["tx_date"] = (db.household_today(household_id) - timedelta(days=1)).isoformat()
             await _ask_expense_category(update, context, household_id, via_callback=True)
         elif choice == "manual":
             context.chat_data["awaiting"] = "expense_date_manual"
@@ -1055,7 +1090,7 @@ def _period_section_title(p):
     return p["start"] if p["start"] == p["end"] else f"{p['start']} تا {p['end']}"
 
 
-def _report_text_periods(r, cur, title):
+def _report_text_periods(r, cur, title, household_id):
     """رندر متنی گزارش تفکیک‌شده بر اساس بازه‌های بودجه *واقعی* خانواده (خروجی db.get_report_by_periods)
     — چون بودجه ممکنه هفتگی باشه، یه گزارش ماهانه چند تا بازه بودجه مختلف رو در بر می‌گیره و باید هر
     کدوم با جمع خودش جدا نشون داده بشه (نه یه لیست تخت). اگه کل بازه فقط یه بازه بودجه رو شامل بشه
@@ -1088,7 +1123,7 @@ def _report_text_periods(r, cur, title):
         lines.append("")
 
     lines.append(f"جمع کل {title} (داخل بودجه): {fmt(r['total'], cur)}")
-    today_str = date.today().isoformat()
+    today_str = db.household_today(household_id).isoformat()
     if r["start"] <= today_str <= r["end"]:
         # فقط وقتی امروز واقعاً داخل بازه‌ی درخواستی باشه نشون بده — برای یه بازه/هفته گذشته
         # (مثلاً از دکمه‌های بازه‌های اخیر) نشون دادن «هزینه امروز» گمراه‌کننده‌ست.
@@ -1117,7 +1152,7 @@ def _report_text(household_id, period):
     if period == "month":
         start, end = db.report_period_bounds(household_id, "month")
         r = db.get_report_by_periods(household_id, start, end)
-        return _report_text_periods(r, cur, title)
+        return _report_text_periods(r, cur, title, household_id)
     r = db.get_report(household_id, period)
     return _report_text_core(r, cur, title, show_date_headers=(period != "day"))
 
@@ -1132,7 +1167,7 @@ def _report_text_range(household_id, start, end):
     cur = db.get_currency(household_id)
     r = db.get_report_by_periods(household_id, start, end)
     title = _report_title_for_range(start, end)
-    return _report_text_periods(r, cur, title)
+    return _report_text_periods(r, cur, title, household_id)
 
 
 @require_household
@@ -1753,6 +1788,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["awaiting"] = "currency"
         await query.edit_message_text("واحد پول جدید رو بفرست، مثلاً: EUR یا یورو یا $")
 
+    elif action == "timezone":
+        tz = db.get_timezone(household_id)
+        context.chat_data["awaiting"] = "timezone"
+        await query.edit_message_text(
+            f"منطقه زمانی فعلی: {tz}\n\n"
+            "نام منطقه زمانی جدید رو بفرست (فرمت استاندارد IANA)، مثلاً:\n"
+            "Europe/Madrid\n"
+            "Asia/Tehran\n"
+            "Europe/London\n\n"
+            "⚠️ این همون چیزیه که تعیین می‌کنه بازه بودجه (هفتگی/ماهانه) دقیقاً کِی تموم می‌شه — "
+            "اگه اشتباه باشه، نزدیک نیمه‌شب ممکنه بازه با تأخیر یا تعجیل عوض بشه."
+        )
+
     elif action == "categories":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ افزودن دسته", callback_data="m:addcategory")],
@@ -2079,6 +2127,22 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         new_currency = db.set_currency(household_id, text)
         await update.message.reply_text(f"✅ واحد پول روی «{new_currency}» تنظیم شد.")
         return
+    if awaiting == "timezone":
+        try:
+            new_tz = db.set_timezone(household_id, text)
+        except ValueError:
+            await update.message.reply_text(
+                f"«{text}» یه نام منطقه زمانی معتبر (IANA) نیست. مثال درست: Europe/Madrid یا Asia/Tehran\n"
+                "دوباره بفرست، یا از /menu برای لغو استفاده کن."
+            )
+            context.chat_data["awaiting"] = "timezone"
+            return
+        now_local = datetime.now(ZoneInfo(new_tz))
+        await update.message.reply_text(
+            f"✅ منطقه زمانی روی «{new_tz}» تنظیم شد.\n"
+            f"ساعت الان به این تایم‌زون: {now_local.strftime('%Y-%m-%d %H:%M')}"
+        )
+        return
     if awaiting == "addcategory_input":
         raw = text.strip()
         if "|" in raw:
@@ -2280,7 +2344,7 @@ def _duplicate_receipt_warning(household_id, store, lines):
     total = sum(l["amount"] for l in lines)
     if total <= 0:
         return None
-    match = db.find_similar_receipt(household_id, store, total, date.today())
+    match = db.find_similar_receipt(household_id, store, total, db.household_today(household_id))
     if not match:
         return None
     cur = db.get_currency(household_id)
@@ -2571,6 +2635,7 @@ async def _post_init(application: Application):
         BotCommand("newlist", "لیست خرید جدید"),
         BotCommand("list", "نمایش لیست خرید"),
         BotCommand("currency", "تغییر واحد پول"),
+        BotCommand("timezone", "منطقه زمانی (برای محاسبه درست بازه بودجه)"),
         BotCommand("categories", "دسته‌بندی‌ها"),
         BotCommand("addcategory", "اضافه‌کردن دسته جدید"),
         BotCommand("delcategory", "حذف دسته اختصاصی"),
@@ -2588,9 +2653,11 @@ async def _post_init(application: Application):
 async def _send_period_end_reports(context: ContextTypes.DEFAULT_TYPE):
     """هر روز یه‌بار اجرا می‌شه (job زمان‌بندی‌شده). برای خانواده‌هایی که امروز آخرین روز بازه
     بودجه‌شونه (هفتگی یا ماهانه)، گزارش خلاصه بازه رو خودکار برای همه اعضا می‌فرسته."""
-    today = date.today()
     for household_id in db.get_all_household_ids():
         try:
+            # «امروز» باید به وقت محلی همین خانواده حساب بشه، نه یه امروز مشترک واحد برای همه —
+            # چون هر خانواده می‌تونه منطقه زمانی جدا داشته باشه (با /timezone).
+            today = db.household_today(household_id)
             start, end, period_key, period_type = db.get_current_period_bounds(household_id, today)
             if end != today:
                 continue
@@ -2707,6 +2774,7 @@ def main():
     app.add_handler(CommandHandler("addcategory", addcategory_cmd))
     app.add_handler(CommandHandler("delcategory", delcategory_cmd))
     app.add_handler(CommandHandler("currency", currency_cmd))
+    app.add_handler(CommandHandler("timezone", timezone_cmd))
     app.add_handler(CommandHandler("newlist", newlist_cmd))
     app.add_handler(CommandHandler("donelist", donelist_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
@@ -2730,15 +2798,17 @@ def main():
     if app.job_queue:
         # نکته مهم: JobQueue اگه tzinfo رو صریح روی خودِ datetime.time ندیم، پیش‌فرض UTC حساب می‌کنه
         # (نه وقت سرور، نه وقت خانواده) — چون نه سرور TZ ست داره و نه اینجا Defaults(tzinfo=...) دادیم.
-        # برای همینه ساعت‌های ۱۳/۲۲ قبلاً شیفت‌خورده (با تاخیر ~۲ ساعت به وقت اسپانیا) اجرا می‌شدن.
-        # اینجا صریحاً وقت محلی خانواده (اسپانیا) رو می‌ذاریم تا واقعاً همون ساعتِ گفته‌شده اجرا بشه.
-        LOCAL_TZ = ZoneInfo("Europe/Madrid")
-        # هر روز ساعت ۲۱:۰۰ به وقت اسپانیا چک می‌کنه؛ فقط برای خانواده‌هایی که امروز آخرین روز
-        # بازه بودجه‌شونه واقعاً پیام می‌فرسته
-        app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0, tzinfo=LOCAL_TZ))
-        # روزی دو بار (۱۳:۰۰ و ۲۲:۰۰ به وقت اسپانیا) چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
-        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=13, minute=0, tzinfo=LOCAL_TZ))
-        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=22, minute=0, tzinfo=LOCAL_TZ))
+        # این تایم‌زون فقط تعیین می‌کنه این job روزانه *چه ساعتی* اجرا بشه (پیش‌فرض با DEFAULT_TIMEZONE
+        # قابل تنظیمه). محاسبه‌ی این‌که «امروز» برای هر خانواده کدوم روزه (و در نتیجه بازه بودجه کِی تموم
+        # می‌شه) دیگه به این وابسته نیست — اون از /timezone هر خانواده به‌طور جدا خونده می‌شه
+        # (db.household_today)، برای همینه یه خانواده می‌تونه تایم‌زون متفاوتی داشته باشه.
+        JOB_TZ = ZoneInfo(db.DEFAULT_TIMEZONE)
+        # هر روز ساعت ۲۱:۰۰ (به وقت JOB_TZ) چک می‌کنه؛ فقط برای خانواده‌هایی که امروزِ *خودشون*
+        # (به وقت تایم‌زون خودشون) آخرین روز بازه بودجه‌شونه واقعاً پیام می‌فرسته
+        app.job_queue.run_daily(_send_period_end_reports, time=dt_time(hour=21, minute=0, tzinfo=JOB_TZ))
+        # روزی دو بار (۱۳:۰۰ و ۲۲:۰۰ به وقت JOB_TZ) چک می‌کنه ببینه ایمیل جدیدی از فروشگاه (مثلاً Mercadona) اومده یا نه
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=13, minute=0, tzinfo=JOB_TZ))
+        app.job_queue.run_daily(_check_email_receipts, time=dt_time(hour=22, minute=0, tzinfo=JOB_TZ))
     else:
         logger.warning(
             "JobQueue در دسترس نیست (پکیج python-telegram-bot[job-queue] نصب نشده)؛ "
