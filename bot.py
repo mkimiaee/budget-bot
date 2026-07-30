@@ -794,7 +794,7 @@ async def _register_expense(update, context, household_id, text, source="manual"
         "این هزینه جزو بودجه باشه یا هزینه جانبیه (مثل قبض) که فقط تو گزارش میاد؟",
         reply_markup=_in_budget_choice_keyboard("quickbudget"),
     )
-    return None
+    return True
 
 
 # ---------------- ثبت هزینه مرحله‌به‌مرحله (وقتی متن آزاد قابل اعتماد نیست) ----------------
@@ -896,6 +896,7 @@ async def exp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("منوی اصلی 👇", reply_markup=MAIN_MENU_KEYBOARD)
 
     elif action == "quickinfo":
+        context.chat_data["awaiting"] = "expense_quickline"
         await query.edit_message_text(
             "بنویس: مبلغ و توضیح، مثلاً: نان 50000\n"
             "اگه بخوای فروشگاه/تاریخ هم بگی: نان 50000 فروشگاه رفاه تاریخ 2026-07-10"
@@ -2090,21 +2091,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, household_id):
     text = update.message.text.strip()
 
-    # حالت ۱: در حال تکمیل یک لیست خرید هستیم
-    # نکته: اگه متن دقیقاً یکی از دکمه‌های منوی اصلی باشه (مثلاً کاربر زده روی «لیست خرید»
-    # تا وضعیت لیست رو ببینه)، نباید به‌عنوان یک آیتم اضافه بشه؛ باید به منو مسیریابی بشه.
-    list_id = context.chat_data.get("collecting_list_id")
-    if list_id and text not in MAIN_MENU_LABELS:
-        lines = [l for l in text.splitlines() if l.strip()]
-        db.add_list_items(list_id, lines)
-        await update.message.reply_text(f"➕ {len(lines)} آیتم به لیست اضافه شد. بازم بفرست یا /donelist بزن.")
-        return
-
-    # حالت ۲: یکی از دکمه‌های منوی اصلی زده شده
+    # حالت ۱: یکی از دکمه‌های منوی اصلی زده شده
     if await menu_button_router(update, context, household_id, text):
         return
 
-    # حالت ۳: منتظر یک مقدار خاص هستیم (بعد از زدن دکمه‌ای از تنظیمات/منو)
+    # حالت ۲: منتظر یک مقدار خاص هستیم (بعد از زدن دکمه‌ای از تنظیمات/منو/ثبت هزینه)
+    # نکته مهم: این حالت باید قبل از «تکمیل لیست خرید» چک بشه. وگرنه اگه یه لیست خرید باز
+    # مونده باشه (کاربر /donelist نزده)، هر متنی — حتی وقتی کاربر صریحاً از منو «ثبت هزینه»
+    # و «ثبت سریع» رو زده — به‌جای ثبت هزینه، اشتباهی به همون لیست خرید اضافه می‌شد.
     awaiting = context.chat_data.pop("awaiting", None)
     if awaiting == "income":
         await _register_income(update, household_id, text)
@@ -2306,8 +2300,30 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         draft["tx_date"] = tx_date
         await _ask_expense_category(update, context, household_id, via_callback=False)
         return
+    if awaiting == "expense_quickline":
+        # کاربر صریحاً از منو «➖ ثبت هزینه» → «🔤 ثبت سریع» رو زده؛ همین متن باید هزینه ثبت
+        # بشه، حتی اگه یه لیست خرید باز (تکمیل‌نشده) هم داشته باشه.
+        result = await _register_expense(update, context, household_id, text, source="manual")
+        if result is None:
+            # مبلغ قابل تشخیص نبود؛ همچنان منتظر ثبت سریع بمون تا پیام بعدی هم اشتباهی
+            # قاطی لیست خرید نشه.
+            context.chat_data["awaiting"] = "expense_quickline"
+        return
 
-    # حالت ۳.۵: چند خط فرستاده ولی لیست خرید فعالی برای تکمیل باز نکرده — احتمالاً می‌خواسته
+    # حالت ۳: در حال تکمیل یک لیست خرید هستیم
+    # نکته: اگه متن دقیقاً یکی از دکمه‌های منوی اصلی باشه (مثلاً کاربر زده روی «لیست خرید»
+    # تا وضعیت لیست رو ببینه)، نباید به‌عنوان یک آیتم اضافه بشه؛ باید به منو مسیریابی بشه.
+    # این چک عمداً بعد از تمام حالت‌های awaiting هست، چون اگه کاربر صریحاً یه فرآیند دیگه
+    # (مثل ثبت هزینه، ثبت درآمد، تنظیم بودجه و ...) رو از منو شروع کرده، اون نیت صریح باید
+    # برنده بشه، نه اضافه‌شدن ناخواسته به لیست خرید باز.
+    list_id = context.chat_data.get("collecting_list_id")
+    if list_id and text not in MAIN_MENU_LABELS:
+        lines = [l for l in text.splitlines() if l.strip()]
+        db.add_list_items(list_id, lines)
+        await update.message.reply_text(f"➕ {len(lines)} آیتم به لیست اضافه شد. بازم بفرست یا /donelist بزن.")
+        return
+
+    # حالت ۴: چند خط فرستاده ولی لیست خرید فعالی برای تکمیل باز نکرده — احتمالاً می‌خواسته
     # آیتم لیست خرید وارد کنه (بدون اینکه اول روی «🛒 لیست خرید» / /newlist بزنه) و اگه همینجوری
     # به‌عنوان هزینه امتحانش کنیم، ممکنه یه عدد تصادفی تو اسم یکی از آیتم‌ها (مثلاً «شیر ۲ لیتر»)
     # اشتباهی به‌عنوان مبلغ برداشت بشه. به‌جای حدس زدن، ازش می‌پرسیم منظورش چی بوده.
@@ -2325,7 +2341,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE, househol
         )
         return
 
-    # حالت ۴ (پیش‌فرض): پیام را به‌عنوان هزینه ثبت کن
+    # حالت ۵ (پیش‌فرض): پیام را به‌عنوان هزینه ثبت کن
     await _register_expense(update, context, household_id, text, source="manual")
 
 
